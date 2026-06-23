@@ -7,7 +7,17 @@ from click.testing import CliRunner
 
 from ecs_doctor.cli import _confidence_color, _to_json_safe, cli
 from ecs_doctor.engine import DiagnosisRequest, DiagnosisResult
-from ecs_doctor.models import Finding, FindingType, RootCause, Severity
+from ecs_doctor.models import (
+    ContainerConfig,
+    DeploymentConfig,
+    Finding,
+    FindingType,
+    MetricSnapshot,
+    RootCause,
+    ServiceConfig,
+    Severity,
+    TaskConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -308,3 +318,175 @@ class TestErrorHandling:
             )
         assert result.exit_code == 0
         ms.assert_called_once_with(region_name=None, profile_name="my-profile")
+
+
+# ---------------------------------------------------------------------------
+# Helper for full-featured result (metrics + config + task)
+# ---------------------------------------------------------------------------
+
+def _make_result_full() -> DiagnosisResult:
+    dc = DeploymentConfig(100, 200, False, False)
+    svc_cfg = ServiceConfig(
+        service_arn="arn:aws:ecs:us-east-1:123:service/c/s",
+        service_name="s",
+        cluster_arn="arn:aws:ecs:us-east-1:123:cluster/c",
+        desired_count=2,
+        running_count=1,
+        pending_count=0,
+        launch_type="FARGATE",
+        platform_version="LATEST",
+        deployment_config=dc,
+        capacity_provider_strategy=[],
+        health_check_grace_period_seconds=30,
+    )
+    container = ContainerConfig(
+        name="app",
+        image="my-repo/my-image:latest",
+        cpu=256,
+        memory=512,
+        memory_reservation=None,
+        essential=True,
+        environment={},
+        health_check=None,
+        log_driver="awslogs",
+        log_group="/ecs/my-svc",
+    )
+    task_cfg = TaskConfig(
+        task_definition_arn="arn:aws:ecs:us-east-1:123:task-definition/my-td:3",
+        family="my-td",
+        revision=3,
+        cpu="256",
+        memory="512",
+        network_mode="awsvpc",
+        launch_type="FARGATE",
+        execution_role_arn=None,
+        task_role_arn=None,
+        containers=[container],
+    )
+    metrics = MetricSnapshot(
+        cluster="c",
+        service="s",
+        period_seconds=300,
+        lookback_hours=3,
+        cpu_avg_percent=45.0,
+        cpu_max_percent=60.0,
+        memory_avg_percent=50.0,
+        memory_max_percent=65.0,
+    )
+    return DiagnosisResult(
+        request=DiagnosisRequest(cluster="c", service="s", region="us-east-1", account_id="123456789012"),
+        root_cause=_root_cause(),
+        all_findings=[],
+        duration_ms=42,
+        service_config=svc_cfg,
+        task_config=task_cfg,
+        metrics=metrics,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Render function coverage
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnoseRichOutputWithConfig:
+    def test_metrics_section_rendered(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result_full()
+            result = runner.invoke(cli, ["diagnose", "--cluster", "c", "--service", "s"])
+        assert result.exit_code == 0
+        assert "CPU" in result.output or "Memory" in result.output or "Metric" in result.output
+
+    def test_service_config_section_rendered(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result_full()
+            result = runner.invoke(cli, ["diagnose", "--cluster", "c", "--service", "s"])
+        assert result.exit_code == 0
+        assert "Service Configuration" in result.output or "Desired" in result.output
+
+    def test_task_config_section_rendered(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result_full()
+            result = runner.invoke(cli, ["diagnose", "--cluster", "c", "--service", "s"])
+        assert result.exit_code == 0
+        assert "Task Definition" in result.output or "my-image" in result.output
+
+
+# ---------------------------------------------------------------------------
+# stream-logs flag behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestStreamLogs:
+    def test_stream_logs_and_json_are_mutually_exclusive(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result()
+            result = runner.invoke(
+                cli,
+                ["diagnose", "--cluster", "c", "--service", "s", "--stream-logs", "--json"],
+            )
+        assert result.exit_code != 0
+
+    def test_stream_logs_calls_run_stream(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch("ecs_doctor.cli._run_stream") as mock_stream,
+        ):
+            ms.return_value = _make_session()
+            result = runner.invoke(
+                cli, ["diagnose", "--cluster", "c", "--service", "s", "--stream-logs"]
+            )
+        mock_stream.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# NoCredentialsError raised inside run_diagnosis
+# ---------------------------------------------------------------------------
+
+
+class TestRunDiagnosisCredentialsError:
+    def test_no_creds_from_run_diagnosis_exits_1(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE, side_effect=NoCredentialsError()),
+        ):
+            ms.return_value = _make_session()
+            result = runner.invoke(cli, ["diagnose", "--cluster", "c", "--service", "s"])
+        assert result.exit_code == 1
+        assert "credentials" in result.output.lower()
+
+    def test_no_creds_from_run_diagnosis_json_mode(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE, side_effect=NoCredentialsError()),
+        ):
+            ms.return_value = _make_session()
+            result = runner.invoke(
+                cli, ["diagnose", "--cluster", "c", "--service", "s", "--json"]
+            )
+        assert result.exit_code == 1
+        data = json.loads(result.output)
+        assert "error" in data

@@ -58,3 +58,10 @@ include = ["ecs_doctor*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.coverage.run]
+omit = [
+    "ecs_doctor/web/*",
+    "ecs_doctor/wizard.py",
+    "ecs_doctor/streaming.py",
+]
