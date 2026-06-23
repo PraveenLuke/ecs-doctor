@@ -10,7 +10,7 @@ templates = Jinja2Templates(directory=str(_HERE / "templates"))
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="ECS Doctor", version="0.3.0", docs_url="/api/docs")
+    app = FastAPI(title="ECS Doctor", version="0.2.0", docs_url="/api/docs")
 
     app.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
 
