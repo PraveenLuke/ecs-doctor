@@ -1,6 +1,6 @@
-# ecs-task-doctor
+# ecs-doctor
 
-[![PyPI version](https://img.shields.io/pypi/v/ecs-task-doctor.svg)](https://pypi.org/project/ecs-task-doctor/)
+[![PyPI version](https://img.shields.io/pypi/v/ecs-doctor.svg)](https://pypi.org/project/ecs-doctor/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 
@@ -23,7 +23,7 @@ You're tabbing between four AWS console screens at 2am, each one showing raw dat
 
 There is currently no open-source tool that aggregates these four signals into a single root-cause report. The AWS CLI, boto3 scripts, and the ECS console only expose raw data per service — they do not correlate findings across signals or tell you what to fix.
 
-`ecs-task-doctor` does that.
+`ecs-doctor` does that.
 
 ---
 
@@ -31,7 +31,7 @@ There is currently no open-source tool that aggregates these four signals into a
 
 > "It's 2am. PagerDuty woke you up. `DesiredCount: 3, RunningCount: 0`. You open the ECS console, see 'essential container in task exited', switch to CloudWatch Logs to find the crash, switch to the target group to check health, go back to the service events to see if it's been flapping for 20 minutes or 20 seconds. Thirty minutes later you realize it was a DockerHub rate limit. You've done this exact sequence fifteen times this year."
 
-`ecs-task-doctor` runs all four checks in parallel and tells you the most likely root cause with a confidence score and a suggested fix.
+`ecs-doctor` runs all four checks in parallel and tells you the most likely root cause with a confidence score and a suggested fix.
 
 ---
 
@@ -39,13 +39,13 @@ There is currently no open-source tool that aggregates these four signals into a
 
 ```bash
 # Recommended: install with pipx for an isolated environment
-pipx install ecs-task-doctor
+pipx install ecs-doctor
 
 # Or with pip
-pip install ecs-task-doctor
+pip install ecs-doctor
 
 # Development install (includes test dependencies)
-git clone https://github.com/praveenrajkoilraj/ecs-task-doctor
+git clone https://github.com/PraveenLuke/ecs-task-doctor
 cd ecs-task-doctor
 pip install -e ".[dev]"
 ```
@@ -66,7 +66,7 @@ ecs-doctor diagnose --cluster my-cluster --service my-service --json
 
 ### AWS Credentials
 
-`ecs-task-doctor` uses the standard boto3 credential chain — no custom auth required:
+`ecs-doctor` uses the standard boto3 credential chain — no custom auth required:
 
 1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
 2. AWS named profiles (`~/.aws/credentials`)
@@ -128,7 +128,7 @@ ecs-doctor diagnose --cluster my-cluster --service my-service --json
 
 ## Diagnostic Checks
 
-`ecs-task-doctor` runs four diagnosers and feeds their findings into a root-cause aggregator:
+`ecs-doctor` runs four diagnosers and feeds their findings into a root-cause aggregator:
 
 | Diagnoser | AWS API | What it catches |
 |-----------|---------|-----------------|

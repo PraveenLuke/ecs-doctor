@@ -109,7 +109,7 @@ def _to_json_safe(obj: object) -> object:
 
 
 @click.group()
-@click.version_option(package_name="ecs-task-doctor")
+@click.version_option(package_name="ecs-doctor")
 def cli() -> None:
     """ECS Task Doctor — diagnose why your ECS service is failing."""
 
