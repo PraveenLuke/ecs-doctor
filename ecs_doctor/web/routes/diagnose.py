@@ -33,7 +33,7 @@ def _build_clients(region: str, profile: str | None) -> tuple:
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     from ecs_doctor.web.app import templates
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")
 
 
 @router.post("/diagnose", response_class=HTMLResponse, responses=_RESPONSES_401_500)
@@ -54,7 +54,7 @@ async def diagnose_html(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return templates.TemplateResponse("report.html", {"request": request, "result": result})
+    return templates.TemplateResponse(request, "report.html", {"result": result})
 
 
 @router.get("/api/diagnose", responses=_RESPONSES_401_500)
