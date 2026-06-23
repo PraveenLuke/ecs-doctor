@@ -55,6 +55,9 @@ dev = [
 where = ["."]
 include = ["ecs_doctor*"]
 
+[tool.setuptools.package-data]
+"ecs_doctor.web" = ["static/*", "templates/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
