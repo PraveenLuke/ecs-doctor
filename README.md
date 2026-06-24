@@ -15,26 +15,7 @@ pipx install ecs-doctor
 ecs-doctor diagnose --cluster prod --service payments
 ```
 
-```
-╭─ Root Cause ──────────────────────────────────────────────────────────╮
-│  Container is being OOM-killed (out of memory)          97% confidence │
-│                                                                        │
-│  Suggested fix: Increase the container memory reservation in the task  │
-│  definition. Profile the application for memory leaks — common causes  │
-│  include unbounded caches, unclosed DB connections, JVM heap settings. │
-╰────────────────────────────────────────────────────────────────────────╯
-
-  Source        Type            Severity   Message
-  stop_reasons  oom_killed      CRITICAL   Container 'app' exit 137 (3 tasks)
-  logs          log_crash_sig   CRITICAL   OOM detected in CloudWatch Logs
-  events        task_thrashing  CRITICAL   4 starts / 4 stops in last 20 events
-
-  Metric              Average    Maximum
-  CPU Utilization      12.4%      18.1%
-  Memory Utilization   94.2%      99.8%
-
-Diagnosis completed in 843ms.
-```
+![ECS Doctor demo output](docs/demo.svg)
 
 ---
 
