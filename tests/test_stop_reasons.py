@@ -253,3 +253,68 @@ def test_task_arns_returned():
     )
     _, arns = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
     assert arns == [_TASK_ARN]
+
+
+# ---------------------------------------------------------------------------
+# Exit 126 / 127 — container start failure
+# ---------------------------------------------------------------------------
+
+def test_exit_126_not_executable():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(exit_code=126)])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.HIGH
+    assert "not executable" in f.message or "126" in f.message
+
+
+def test_exit_127_command_not_found():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(exit_code=127)])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.HIGH
+    assert "not found" in f.message or "127" in f.message
+
+
+# ---------------------------------------------------------------------------
+# CannotStartContainerError in container reason
+# ---------------------------------------------------------------------------
+
+def test_cannot_start_container_error():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(reason="CannotStartContainerError: failed to start container")])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# ServiceSchedulerInitiated / UserInitiated stopCodes
+# ---------------------------------------------------------------------------
+
+def test_scheduler_replaced_stop_code():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(stop_code="ServiceSchedulerInitiated", stopped_reason="Scaling activity initiated by deployment")],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.SCHEDULER_REPLACED for f in findings)
+
+
+def test_user_initiated_stop_code():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(stop_code="UserInitiated", stopped_reason="Task stopped by user")],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.USER_INITIATED_STOP for f in findings)

@@ -23,11 +23,12 @@ def _build_clients(region: str, profile: str | None) -> tuple:
     logs = session.client("logs", region_name=region)
     elb = session.client("elbv2", region_name=region)
     cw = session.client("cloudwatch", region_name=region)
+    ec2 = session.client("ec2", region_name=region)
     try:
         account_id = session.client("sts", region_name=region).get_caller_identity()["Account"]
     except (ClientError, NoCredentialsError):
         account_id = "unknown"
-    return ecs, logs, elb, cw, account_id
+    return ecs, logs, elb, cw, ec2, account_id
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -50,8 +51,10 @@ async def clusters_options(region: str = "us-east-1", profile: str | None = None
     except Exception:
         clusters = []
     if not clusters:
-        return HTMLResponse('<option value="" disabled>No clusters found</option>')
-    return HTMLResponse("\n".join(f'<option value="{c}">{c}</option>' for c in clusters))
+        return HTMLResponse('<option value="" disabled selected>No clusters found</option>')
+    options = '<option value="" disabled selected>— Select a cluster —</option>\n'
+    options += "\n".join(f'<option value="{c}">{c}</option>' for c in clusters)
+    return HTMLResponse(options)
 
 
 @router.get("/api/services-options", response_class=HTMLResponse)
@@ -65,8 +68,10 @@ async def services_options(cluster: str = "", region: str = "us-east-1", profile
     except Exception:
         services = []
     if not services:
-        return HTMLResponse('<option value="" disabled>No services found</option>')
-    return HTMLResponse("\n".join(f'<option value="{s}">{s}</option>' for s in services))
+        return HTMLResponse('<option value="" disabled selected>No services found</option>')
+    options = '<option value="" disabled selected>— Select a service —</option>\n'
+    options += "\n".join(f'<option value="{s}">{s}</option>' for s in services)
+    return HTMLResponse(options)
 
 
 @router.post("/diagnose", response_class=HTMLResponse, responses=_RESPONSES_401_500)
@@ -88,9 +93,9 @@ async def diagnose_html(
         )
 
     try:
-        ecs, logs, elb, cw, account_id = _build_clients(region, profile or None)
+        ecs, logs, elb, cw, ec2, account_id = _build_clients(region, profile or None)
         req = DiagnosisRequest(cluster=cluster, service=service, region=region, account_id=account_id)
-        result = run_diagnosis(ecs_client=ecs, logs_client=logs, elb_client=elb, cw_client=cw, request=req)
+        result = run_diagnosis(ecs_client=ecs, logs_client=logs, elb_client=elb, cw_client=cw, request=req, ec2_client=ec2)
     except NoCredentialsError:
         return HTMLResponse(
             '<div class="card error-card">'
@@ -120,9 +125,9 @@ async def diagnose_json(
     profile: str | None = None,
 ) -> JSONResponse:
     try:
-        ecs, logs, elb, cw, account_id = _build_clients(region, profile)
+        ecs, logs, elb, cw, ec2, account_id = _build_clients(region, profile)
         req = DiagnosisRequest(cluster=cluster, service=service, region=region, account_id=account_id)
-        result = run_diagnosis(ecs_client=ecs, logs_client=logs, elb_client=elb, cw_client=cw, request=req)
+        result = run_diagnosis(ecs_client=ecs, logs_client=logs, elb_client=elb, cw_client=cw, request=req, ec2_client=ec2)
     except NoCredentialsError as exc:
         raise HTTPException(status_code=401, detail="No AWS credentials found.") from exc
     except Exception as exc:

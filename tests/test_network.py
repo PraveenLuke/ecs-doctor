@@ -12,7 +12,7 @@ from tests.conftest import (
 )
 
 from ecs_doctor.diagnosers.network import _has_outbound_internet, diagnose_network
-from ecs_doctor.models import FindingType
+from ecs_doctor.models import FindingType, Severity
 
 _SUBNET_ID = "subnet-12345"
 _SG_ID = "sg-67890"
@@ -184,3 +184,89 @@ class TestDiagnoseNetwork:
             describe_security_groups={"SecurityGroups": []},
         )
         assert _call(ecs, ec2) == []
+
+
+# ---------------------------------------------------------------------------
+# VPC endpoint suppression — no NAT but ECR/S3 endpoints present
+# ---------------------------------------------------------------------------
+
+def _vpc_endpoints_resp(region=REGION, has_required=True):
+    if not has_required:
+        return {"VpcEndpoints": []}
+    return {
+        "VpcEndpoints": [
+            {"ServiceName": f"com.amazonaws.{region}.ecr.api", "State": "available"},
+            {"ServiceName": f"com.amazonaws.{region}.ecr.dkr", "State": "available"},
+            {"ServiceName": f"com.amazonaws.{region}.s3", "State": "available"},
+        ]
+    }
+
+
+def test_no_nat_but_vpc_endpoints_suppresses_finding():
+    ecs = make_ecs_client(describe_services=_svc())
+    ec2 = make_ecs_client(
+        describe_route_tables={"RouteTables": [{"Routes": [{"GatewayId": "local", "DestinationCidrBlock": "10.0.0.0/16"}], "VpcId": "vpc-abc123"}]},
+        describe_vpc_endpoints=_vpc_endpoints_resp(has_required=True),
+        describe_security_groups=_security_groups(has_egress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert not any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)
+
+
+def test_no_nat_no_vpc_endpoints_produces_finding():
+    ecs = make_ecs_client(describe_services=_svc())
+    ec2 = make_ecs_client(
+        describe_route_tables={"RouteTables": [{"Routes": [{"GatewayId": "local", "DestinationCidrBlock": "10.0.0.0/16"}], "VpcId": "vpc-abc123"}]},
+        describe_vpc_endpoints=_vpc_endpoints_resp(has_required=False),
+        describe_security_groups=_security_groups(has_egress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# NACL deny check
+# ---------------------------------------------------------------------------
+
+def _nacl_resp(rule_action="allow", from_port=443, to_port=443):
+    return {
+        "NetworkAcls": [
+            {
+                "Entries": [
+                    {
+                        "RuleNumber": 100,
+                        "Egress": True,
+                        "RuleAction": rule_action,
+                        "Protocol": "6",
+                        "PortRange": {"From": from_port, "To": to_port},
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def test_nacl_deny_on_443_produces_finding():
+    ecs = make_ecs_client(describe_services=_svc())
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_security_groups(has_egress=True),
+        describe_network_acls=_nacl_resp(rule_action="deny", from_port=0, to_port=65535),
+    )
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.NETWORK_ACL_DENY for f in findings)
+    f = next(x for x in findings if x.type == FindingType.NETWORK_ACL_DENY)
+    assert f.severity == Severity.HIGH
+
+
+def test_nacl_allow_produces_no_finding():
+    ecs = make_ecs_client(describe_services=_svc())
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_security_groups(has_egress=True),
+        describe_network_acls=_nacl_resp(rule_action="allow", from_port=0, to_port=65535),
+    )
+    findings = _call(ecs, ec2)
+    assert not any(f.type == FindingType.NETWORK_ACL_DENY for f in findings)

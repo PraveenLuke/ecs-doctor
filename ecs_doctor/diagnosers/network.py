@@ -10,6 +10,9 @@ _NFS_PORT = 2049
 _INTERNET_GATEWAY_PREFIX = "igw-"
 _NAT_GATEWAY_PREFIX = "nat-"
 _SOURCE = "network"
+_NACL_DENY = "deny"
+_NACL_EGRESS = True
+_ECR_ENDPOINT_SUFFIXES = frozenset({"ecr.api", "ecr.dkr", "s3"})
 
 
 def _has_outbound_internet(routes: list[dict]) -> bool:
@@ -23,6 +26,66 @@ def _has_outbound_internet(routes: list[dict]) -> bool:
         if target.startswith(_INTERNET_GATEWAY_PREFIX) or target.startswith(_NAT_GATEWAY_PREFIX):
             return True
     return False
+
+
+def _has_vpc_endpoints(ec2_client, vpc_id: str, region: str) -> bool:
+    """Return True if the VPC has the core endpoints needed for ECR, S3, and secrets.
+
+    If present, tasks in private subnets without NAT can still pull images and read secrets.
+    """
+    try:
+        resp = ec2_client.describe_vpc_endpoints(
+            Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "state", "Values": ["available"]},
+            ]
+        )
+    except ClientError:
+        return False
+
+    endpoint_services: set[str] = {ep.get("ServiceName", "") for ep in resp.get("VpcEndpoints", [])}
+    required = {f"com.amazonaws.{region}.{suffix}" for suffix in _ECR_ENDPOINT_SUFFIXES}
+    return required.issubset(endpoint_services)
+
+
+def _check_nacl(ec2_client, subnet_id: str, region: str, account_id: str) -> Finding | None:
+    """Return a finding if a NACL explicitly denies outbound traffic on port 443 or 80."""
+    try:
+        resp = ec2_client.describe_network_acls(
+            Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+        )
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return iam_finding(
+                "ec2:DescribeNetworkAcls",
+                f"arn:aws:ec2:{region}:{account_id}:network-acl/*",
+                _SOURCE,
+            )
+        raise
+
+    nacls = resp.get("NetworkAcls", [])
+    if not nacls:
+        return None
+
+    egress_entries = [e for e in nacls[0].get("Entries", []) if e.get("Egress") is _NACL_EGRESS]
+    for entry in sorted(egress_entries, key=lambda e: e.get("RuleNumber", 32767)):
+        if entry.get("RuleAction", "").lower() != _NACL_DENY:
+            continue
+        from_port = entry.get("PortRange", {}).get("From", 0)
+        to_port = entry.get("PortRange", {}).get("To", 0)
+        if from_port <= _HTTPS_PORT <= to_port or from_port <= _HTTP_PORT <= to_port:
+            return Finding(
+                type=FindingType.NETWORK_ACL_DENY,
+                message=(
+                    f"Network ACL rule {entry.get('RuleNumber')} in subnet {subnet_id} "
+                    f"explicitly DENIES outbound traffic on ports {from_port}–{to_port}. "
+                    "Tasks cannot reach ECR, Secrets Manager, or external APIs."
+                ),
+                severity=Severity.HIGH,
+                raw_data={"subnet_id": subnet_id, "nacl_entry": entry},
+                source=_SOURCE,
+            )
+    return None
 
 
 def _check_subnet_egress(ec2_client, subnet_id: str, region: str, account_id: str) -> Finding | None:
@@ -41,18 +104,24 @@ def _check_subnet_egress(ec2_client, subnet_id: str, region: str, account_id: st
         return None
 
     routes = route_tables[0].get("Routes", [])
-    if not _has_outbound_internet(routes):
-        return Finding(
-            type=FindingType.NETWORK_CONNECTIVITY,
-            message=(
-                f"Subnet {subnet_id} has no route to the internet (no IGW or NAT Gateway). "
-                "Tasks in this subnet cannot pull images, reach Secrets Manager, or call external APIs."
-            ),
-            severity=Severity.HIGH,
-            raw_data={"subnet_id": subnet_id, "routes": routes},
-            source=_SOURCE,
-        )
-    return None
+    if _has_outbound_internet(routes):
+        return None
+
+    vpc_id = route_tables[0].get("VpcId", "")
+    if vpc_id and _has_vpc_endpoints(ec2_client, vpc_id, region):
+        return None
+
+    return Finding(
+        type=FindingType.NETWORK_CONNECTIVITY,
+        message=(
+            f"Subnet {subnet_id} has no route to the internet (no IGW or NAT Gateway) "
+            "and no VPC endpoints for ECR/S3. "
+            "Tasks cannot pull images, reach Secrets Manager, or call external APIs."
+        ),
+        severity=Severity.HIGH,
+        raw_data={"subnet_id": subnet_id, "routes": routes, "vpc_id": vpc_id},
+        source=_SOURCE,
+    )
 
 
 def _check_security_group_egress(ec2_client, sg_id: str, region: str, account_id: str) -> Finding | None:
@@ -158,6 +227,11 @@ def diagnose_network(
         if finding:
             findings.append(finding)
             break
+
+    for subnet_id in subnet_ids[:1]:
+        nacl_finding = _check_nacl(ec2_client, subnet_id, region, account_id)
+        if nacl_finding:
+            findings.append(nacl_finding)
 
     for sg_id in sg_ids[:2]:
         finding = _check_security_group_egress(ec2_client, sg_id, region, account_id)

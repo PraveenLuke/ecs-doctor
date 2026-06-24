@@ -13,6 +13,8 @@ from ecs_doctor.models import (
     TaskConfig,
 )
 
+_SOURCE = "config"
+
 _ENV_MASK_VALUE = "***MASKED***"
 _SENSITIVE_KEY_PATTERNS: frozenset[str] = frozenset({
     "password", "secret", "token", "key", "credential", "api_key", "auth",
@@ -114,6 +116,70 @@ def _extract_task_config(td: dict) -> TaskConfig:
     )
 
 
+def _validate_execution_role(td: dict) -> Finding | None:
+    """Return a finding if executionRoleArn is absent from the task definition."""
+    if not td.get("executionRoleArn"):
+        return Finding(
+            type=FindingType.MISSING_EXECUTION_ROLE,
+            message=(
+                "Task definition has no executionRoleArn. "
+                "ECS cannot pull images from ECR, read Secrets Manager secrets, "
+                "or write CloudWatch logs without an execution role."
+            ),
+            severity=Severity.CRITICAL,
+            raw_data={"taskDefinitionArn": td.get("taskDefinitionArn", "")},
+            source="config",
+        )
+    return None
+
+
+def _validate_health_check_grace(td: dict, svc: dict) -> Finding | None:
+    """Return a finding when containers define a health check but the service has no grace period."""
+    container_has_healthcheck = any(
+        c.get("healthCheck") for c in td.get("containerDefinitions", [])
+    )
+    grace = svc.get("healthCheckGracePeriodSeconds")
+    if container_has_healthcheck and not grace:
+        return Finding(
+            type=FindingType.MISSING_HEALTH_CHECK_GRACE_PERIOD,
+            message=(
+                "Containers define a healthCheck but the service has no healthCheckGracePeriodSeconds. "
+                "ECS may terminate tasks that are still starting up before they can pass the health check."
+            ),
+            severity=Severity.MEDIUM,
+            raw_data={"healthCheckGracePeriodSeconds": grace},
+            source="config",
+        )
+    return None
+
+
+def _validate_port_mappings(td: dict, svc: dict) -> Finding | None:
+    """Return a finding when load balancer expects a port not exposed by any container."""
+    load_balancers = svc.get("loadBalancers", [])
+    if not load_balancers:
+        return None
+
+    lb_ports = {lb.get("containerPort") for lb in load_balancers} - {None}
+    exposed_ports = {
+        pm.get("containerPort")
+        for c in td.get("containerDefinitions", [])
+        for pm in c.get("portMappings", [])
+    } - {None}
+    missing = lb_ports - exposed_ports
+    if missing:
+        return Finding(
+            type=FindingType.MISSING_PORT_MAPPING,
+            message=(
+                f"Load balancer expects container port(s) {sorted(missing)} "
+                "but no container in the task definition exposes them in portMappings."
+            ),
+            severity=Severity.HIGH,
+            raw_data={"missing_ports": sorted(missing), "exposed_ports": sorted(exposed_ports)},
+            source="config",
+        )
+    return None
+
+
 def _validate_fargate_cpu_memory(td: dict) -> Finding | None:
     """Return a finding if the Fargate CPU/memory combination is invalid."""
     requires = td.get("requiresCompatibilities", [])
@@ -182,8 +248,13 @@ def diagnose_config(
     task_config = _extract_task_config(td)
 
     findings: list[Finding] = []
-    fargate_finding = _validate_fargate_cpu_memory(td)
-    if fargate_finding:
-        findings.append(fargate_finding)
+    for validator_result in (
+        _validate_fargate_cpu_memory(td),
+        _validate_execution_role(td),
+        _validate_health_check_grace(td, svc),
+        _validate_port_mappings(td, svc),
+    ):
+        if validator_result:
+            findings.append(validator_result)
 
     return findings, service_config, task_config

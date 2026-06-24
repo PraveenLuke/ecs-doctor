@@ -13,6 +13,7 @@ _DEFAULT_PERIOD = 300
 _DEFAULT_LOOKBACK_HOURS = 3
 _CPU_ALERT_THRESHOLD = 85.0
 _MEMORY_ALERT_THRESHOLD = 85.0
+_MEMORY_CRITICAL_THRESHOLD = 85.0  # memory ≥85% → CRITICAL (OOM kill imminent)
 
 
 def _build_metric_queries(
@@ -123,10 +124,11 @@ def _anomaly_findings(snapshot: MetricSnapshot, cluster: str, service: str) -> l
             type=FindingType.HIGH_MEMORY_UTILIZATION,
             message=(
                 f"Average memory utilization is {snapshot.memory_avg_percent:.1f}% "
-                f"(threshold: {_MEMORY_ALERT_THRESHOLD}%) over the last "
-                f"{snapshot.lookback_hours}h for {cluster}/{service}."
+                f"(threshold: {_MEMORY_CRITICAL_THRESHOLD}%) over the last "
+                f"{snapshot.lookback_hours}h for {cluster}/{service}. "
+                "OOM kill risk is elevated."
             ),
-            severity=Severity.HIGH,
+            severity=Severity.CRITICAL,
             raw_data={
                 "memory_avg_percent": snapshot.memory_avg_percent,
                 "memory_max_percent": snapshot.memory_max_percent,

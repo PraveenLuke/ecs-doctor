@@ -28,19 +28,29 @@ class FindingType(str, Enum):
     GRACEFUL_SHUTDOWN_FAIL = "graceful_shutdown_failure"
     SPOT_INTERRUPTED = "spot_interrupted"
     TASK_FAILED_TO_START = "task_failed_to_start"
+    CONTAINER_START_FAILURE = "container_start_failure"
+    SCHEDULER_REPLACED = "scheduler_replaced"
+    USER_INITIATED_STOP = "user_initiated_stop"
     # logs.py
     LOG_CRASH_SIGNATURE = "log_crash_signature"
     DISK_ERROR = "disk_error"
     EFS_MOUNT_FAILURE = "efs_mount_failure"
+    PORT_CONFLICT = "port_conflict"
+    FIRELENS_LOG_DRIVER = "firelens_log_driver"
     # alb_health.py
     ALB_UNHEALTHY = "alb_unhealthy_target"
+    NO_ALB_TARGETS = "no_alb_targets"
     # metrics.py
     HIGH_CPU_UTILIZATION = "high_cpu_utilization"
     HIGH_MEMORY_UTILIZATION = "high_memory_utilization"
     # config.py
     INVALID_TASK_CONFIG = "invalid_task_config"
+    MISSING_EXECUTION_ROLE = "missing_execution_role"
+    MISSING_HEALTH_CHECK_GRACE_PERIOD = "missing_health_check_grace_period"
+    MISSING_PORT_MAPPING = "missing_port_mapping"
     # network.py
     NETWORK_CONNECTIVITY = "network_connectivity"
+    NETWORK_ACL_DENY = "network_acl_deny"
     # shared
     IAM_DENIED = "iam_access_denied"
 

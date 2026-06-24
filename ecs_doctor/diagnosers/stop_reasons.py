@@ -9,9 +9,12 @@ from ecs_doctor.models import Finding, FindingType, Severity
 
 _OOM_EXIT_CODES: frozenset[int] = frozenset({137, 139})
 _SIGTERM_EXIT_CODE = 143
+_EXIT_NOT_EXECUTABLE = 126
+_EXIT_COMMAND_NOT_FOUND = 127
 _STOPPED_STATUS = "STOPPED"
 _ESSENTIAL_LOWER = "essential container"
 _CANNOT_PULL_LOWER = "cannotpullcontainererror"
+_CANNOT_START_LOWER = "cannotstartcontainererror"
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +41,14 @@ _TASK_STOP_CODE_MAP: dict[str, tuple[FindingType, str]] = {
     "EssentialContainerExited": (
         FindingType.ESSENTIAL_EXITED,
         "Essential container exited (task-level stopCode). stoppedReason: {reason}",
+    ),
+    "ServiceSchedulerInitiated": (
+        FindingType.SCHEDULER_REPLACED,
+        "Task replaced by ECS scheduler (scale-in or deployment). stoppedReason: {reason}",
+    ),
+    "UserInitiated": (
+        FindingType.USER_INITIATED_STOP,
+        "Task was manually stopped. stoppedReason: {reason}",
     ),
 }
 
@@ -90,6 +101,55 @@ def _classify_container(
                 "stoppedReason": stopped_reason,
                 "severity": Severity.CRITICAL,
                 "message": f"Container '{name}' could not pull image. Reason: {reason or stopped_reason}",
+            },
+        )
+
+    if _CANNOT_START_LOWER in lower_reason:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, None),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "reason": reason,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.CRITICAL,
+                "message": (
+                    f"Container '{name}' failed to start (CannotStartContainerError). "
+                    "Check volume mounts, cgroup limits, and entrypoint configuration. "
+                    f"Reason: {reason}"
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_NOT_EXECUTABLE:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 126 — entrypoint or command is not executable. "
+                    "Check file permissions on the binary inside the image (chmod +x)."
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_COMMAND_NOT_FOUND:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 127 — command or binary not found. "
+                    "Verify the CMD/ENTRYPOINT path exists inside the image and is on PATH."
+                ),
             },
         )
 

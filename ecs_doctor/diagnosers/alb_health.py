@@ -76,6 +76,31 @@ def _finding_for_target(
             source="alb_health",
         )
 
+    if state == "draining":
+        return Finding(
+            type=FindingType.HEALTH_CHECK_FAIL,
+            message=(
+                f"Target {target_id} is draining — connections being drained before deregistration. "
+                "This is expected during task replacement; if persistent, the task may be crash-looping."
+            ),
+            severity=Severity.LOW,
+            raw_data={"target": target, "state": state, "tg_arn": tg_arn},
+            source="alb_health",
+        )
+
+    if state == "unused" and reason_code == "Target.InvalidState":
+        return Finding(
+            type=FindingType.ALB_UNHEALTHY,
+            message=(
+                f"Target {target_id} is in an invalid state — possible protocol mismatch "
+                "(e.g. HTTP target group performing health checks on an HTTPS endpoint). "
+                "Verify the target group protocol matches the container's listener."
+            ),
+            severity=Severity.MEDIUM,
+            raw_data=raw,
+            source="alb_health",
+        )
+
     return None
 
 
@@ -124,8 +149,22 @@ def _check_target_group(elbv2_client, tg_arn: str) -> list[Finding]:
             )]
         raise
 
+    descriptions = health_resp.get("TargetHealthDescriptions", [])
+    if not descriptions:
+        return [Finding(
+            type=FindingType.NO_ALB_TARGETS,
+            message=(
+                f"Target group {tg_arn} has no registered targets. "
+                "ECS may have failed to register tasks — check that the container port in the task "
+                "definition matches the load balancer configuration and that tasks reached RUNNING state."
+            ),
+            severity=Severity.HIGH,
+            raw_data={"tg_arn": tg_arn},
+            source="alb_health",
+        )]
+
     findings: list[Finding] = []
-    for desc in health_resp.get("TargetHealthDescriptions", []):
+    for desc in descriptions:
         health = desc.get("TargetHealth", {})
         finding = _finding_for_target(
             state=health.get("State", ""),

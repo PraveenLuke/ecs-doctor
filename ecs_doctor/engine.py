@@ -1,6 +1,7 @@
 
 import dataclasses
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from ecs_doctor._aws import ServiceDataCache
@@ -40,31 +41,90 @@ def to_json_safe(obj: object) -> object:
     return obj
 
 
+# ---------------------------------------------------------------------------
+# Private helpers for optional parallel tasks
+# ---------------------------------------------------------------------------
+
+def _run_config(
+    include_config: bool,
+    cache: ServiceDataCache,
+    ecs_client,
+    kwargs: dict,
+) -> tuple[list[Finding], ServiceConfig | None, TaskConfig | None]:
+    if not include_config:
+        return [], None, None
+    from ecs_doctor.diagnosers.config import diagnose_config
+    return diagnose_config(service_cache=cache, ecs_client=ecs_client, **kwargs)
+
+
+def _run_metrics(
+    include_metrics: bool,
+    cw_client,
+    kwargs: dict,
+) -> tuple[list[Finding], MetricSnapshot | None]:
+    if not include_metrics or cw_client is None:
+        return [], None
+    from ecs_doctor.diagnosers.metrics import diagnose_metrics
+    return diagnose_metrics(cw_client=cw_client, **kwargs)
+
+
+def _run_network(
+    cache: ServiceDataCache,
+    ecs_client,
+    ec2_client,
+    kwargs: dict,
+) -> list[Finding]:
+    if ec2_client is None:
+        return []
+    from ecs_doctor.diagnosers.network import diagnose_network
+    return diagnose_network(
+        service_cache=cache, ecs_client=ecs_client, ec2_client=ec2_client, **kwargs
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public orchestration entry point
+# ---------------------------------------------------------------------------
+
 def run_diagnosis(
     ecs_client,
     logs_client,
     elb_client,
     cw_client,
     request: DiagnosisRequest,
+    ec2_client=None,
     include_metrics: bool = True,
     include_config: bool = True,
 ) -> DiagnosisResult:
-    """Orchestrate all diagnosers and return a single DiagnosisResult.
+    """Orchestrate all diagnosers in parallel and return a single DiagnosisResult.
 
-    Called by both cli.py and web routes — zero logic is duplicated between surfaces.
+    Phase 1 runs six diagnosers concurrently via ThreadPoolExecutor.
+    Phase 2 runs diagnose_logs sequentially after stop_reasons completes,
+    because logs depends on the task_arns returned by stop_reasons.
+
+    Called by both cli.py and web routes — zero logic duplicated.
     """
     start_ms = time.monotonic()
 
     cache = ServiceDataCache(ecs_client)
-    kwargs = {
+    kwargs: dict = {
         "cluster": request.cluster,
         "service": request.service,
         "region": request.region,
         "account_id": request.account_id,
     }
 
-    events_findings = diagnose_events(service_cache=cache, **kwargs)
-    stop_findings, task_arns = diagnose_stop_reasons(ecs_client=ecs_client, **kwargs)
+    # Phase 1: parallel execution of all diagnosers that are independent
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_events  = pool.submit(diagnose_events, service_cache=cache, **kwargs)
+        f_stop    = pool.submit(diagnose_stop_reasons, ecs_client=ecs_client, **kwargs)
+        f_alb     = pool.submit(diagnose_alb_health, service_cache=cache, elbv2_client=elb_client, **kwargs)
+        f_config  = pool.submit(_run_config, include_config, cache, ecs_client, kwargs)
+        f_metrics = pool.submit(_run_metrics, include_metrics, cw_client, kwargs)
+        f_network = pool.submit(_run_network, cache, ecs_client, ec2_client, kwargs)
+
+    # Phase 2: logs needs task_arns from stop_reasons (sequential dependency)
+    stop_findings, task_arns = f_stop.result()
     log_findings = diagnose_logs(
         service_cache=cache,
         ecs_client=ecs_client,
@@ -72,26 +132,19 @@ def run_diagnosis(
         task_arns=task_arns,
         **kwargs,
     )
-    alb_findings = diagnose_alb_health(service_cache=cache, elbv2_client=elb_client, **kwargs)
+
+    config_findings, service_config, task_config = f_config.result()
+    metric_findings, metrics = f_metrics.result()
 
     all_findings: list[Finding] = (
-        events_findings + stop_findings + log_findings + alb_findings
+        f_events.result()
+        + stop_findings
+        + log_findings
+        + f_alb.result()
+        + config_findings
+        + metric_findings
+        + f_network.result()
     )
-
-    service_config: ServiceConfig | None = None
-    task_config: TaskConfig | None = None
-    if include_config:
-        from ecs_doctor.diagnosers.config import diagnose_config
-        config_findings, service_config, task_config = diagnose_config(
-            service_cache=cache, ecs_client=ecs_client, **kwargs
-        )
-        all_findings.extend(config_findings)
-
-    metrics: MetricSnapshot | None = None
-    if include_metrics and cw_client is not None:
-        from ecs_doctor.diagnosers.metrics import diagnose_metrics
-        metric_findings, metrics = diagnose_metrics(cw_client=cw_client, **kwargs)
-        all_findings.extend(metric_findings)
 
     root_cause = aggregate(all_findings)
     duration_ms = int((time.monotonic() - start_ms) * 1000)

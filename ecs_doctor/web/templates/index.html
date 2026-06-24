@@ -14,7 +14,8 @@
                hx-trigger="change delay:400ms"
                hx-target="#cluster"
                hx-swap="innerHTML"
-               hx-include="this,[name='profile']">
+               hx-include="this,[name='profile']"
+               hx-on::after-swap="document.getElementById('service').innerHTML='<option value=&quot;&quot; disabled selected>Select a cluster first</option>'">
       </div>
       <div class="field">
         <label for="profile">AWS Profile</label>
@@ -23,7 +24,8 @@
                 hx-trigger="change, load delay:100ms"
                 hx-target="#cluster"
                 hx-swap="innerHTML"
-                hx-include="[name='region'],this">
+                hx-include="[name='region'],this"
+                hx-on::after-swap="document.getElementById('service').innerHTML='<option value=&quot;&quot; disabled selected>Select a cluster first</option>'">
           <option value="">Default credentials</option>
           {% for p in profiles %}
           <option value="{{ p }}">{{ p }}</option>
@@ -34,20 +36,20 @@
 
     <div class="field">
       <label for="cluster">ECS Cluster</label>
-      <select id="cluster" name="cluster"
+      <select id="cluster" name="cluster" required
               hx-get="/api/services-options"
               hx-trigger="change"
               hx-target="#service"
               hx-swap="innerHTML"
               hx-include="[name='region'],[name='profile']">
-        <option value="" disabled>Loading clusters…</option>
+        <option value="" disabled selected>Loading clusters…</option>
       </select>
     </div>
 
     <div class="field">
       <label for="service">ECS Service</label>
       <select id="service" name="service" required>
-        <option value="" disabled>Select a cluster first</option>
+        <option value="" disabled selected>Select a cluster first</option>
       </select>
     </div>
 

@@ -14,7 +14,10 @@ from tests.conftest import (
 from ecs_doctor.diagnosers.config import (
     _extract_health_check,
     _mask_env_value,
+    _validate_execution_role,
     _validate_fargate_cpu_memory,
+    _validate_health_check_grace,
+    _validate_port_mappings,
     diagnose_config,
 )
 from ecs_doctor.models import FindingType, Severity
@@ -53,6 +56,7 @@ def _td(cpu="256", memory="512", requires=None):
             "cpu": cpu,
             "memory": memory,
             "networkMode": "awsvpc",
+            "executionRoleArn": f"arn:aws:iam::{ACCOUNT}:role/ecsTaskExecutionRole",
             "requiresCompatibilities": requires or ["FARGATE"],
             "containerDefinitions": [
                 {
@@ -239,6 +243,17 @@ class TestDiagnoseConfig:
         assert svc_cfg is None
         assert task_cfg is None
 
+    def test_missing_execution_role_produces_finding(self):
+        ecs = make_ecs_client(describe_services=_svc(), describe_task_definition=_td())
+        # Override task definition to have no executionRoleArn
+        td_no_role = _td()
+        td_no_role["taskDefinition"].pop("executionRoleArn", None)
+        ecs2 = make_ecs_client(describe_services=_svc(), describe_task_definition=td_no_role)
+        findings, _, _ = self._call(ecs2)
+        assert any(f.type == FindingType.MISSING_EXECUTION_ROLE for f in findings)
+        f = next(x for x in findings if x.type == FindingType.MISSING_EXECUTION_ROLE)
+        assert f.severity == Severity.CRITICAL
+
     def test_service_without_task_def_arn(self):
         svc_no_td = {"services": [{"serviceName": SERVICE, "loadBalancers": [],
                                     "desiredCount": 1, "runningCount": 0, "pendingCount": 0,
@@ -248,3 +263,72 @@ class TestDiagnoseConfig:
         assert findings == []
         assert svc_cfg is not None
         assert task_cfg is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_execution_role
+# ---------------------------------------------------------------------------
+
+
+class TestValidateExecutionRole:
+    def test_no_execution_role_returns_finding(self):
+        td = {"taskDefinitionArn": "arn:..."}
+        finding = _validate_execution_role(td)
+        assert finding is not None
+        assert finding.type == FindingType.MISSING_EXECUTION_ROLE
+        assert finding.severity == Severity.CRITICAL
+
+    def test_execution_role_present_returns_none(self):
+        td = {"executionRoleArn": "arn:aws:iam::123:role/ecsTaskExecution"}
+        assert _validate_execution_role(td) is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_health_check_grace
+# ---------------------------------------------------------------------------
+
+
+class TestValidateHealthCheckGrace:
+    def test_healthcheck_without_grace_period_returns_finding(self):
+        td = {"containerDefinitions": [{"healthCheck": {"command": ["CMD", "true"]}}]}
+        svc = {}
+        finding = _validate_health_check_grace(td, svc)
+        assert finding is not None
+        assert finding.type == FindingType.MISSING_HEALTH_CHECK_GRACE_PERIOD
+        assert finding.severity == Severity.MEDIUM
+
+    def test_healthcheck_with_grace_period_returns_none(self):
+        td = {"containerDefinitions": [{"healthCheck": {"command": ["CMD", "true"]}}]}
+        svc = {"healthCheckGracePeriodSeconds": 30}
+        assert _validate_health_check_grace(td, svc) is None
+
+    def test_no_healthcheck_returns_none(self):
+        td = {"containerDefinitions": [{"name": "app"}]}
+        svc = {}
+        assert _validate_health_check_grace(td, svc) is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_port_mappings
+# ---------------------------------------------------------------------------
+
+
+class TestValidatePortMappings:
+    def test_missing_port_returns_finding(self):
+        td = {"containerDefinitions": [{"portMappings": [{"containerPort": 8080}]}]}
+        svc = {"loadBalancers": [{"containerPort": 9000}]}
+        finding = _validate_port_mappings(td, svc)
+        assert finding is not None
+        assert finding.type == FindingType.MISSING_PORT_MAPPING
+        assert finding.severity == Severity.HIGH
+        assert 9000 in finding.raw_data["missing_ports"]
+
+    def test_matching_port_returns_none(self):
+        td = {"containerDefinitions": [{"portMappings": [{"containerPort": 8080}]}]}
+        svc = {"loadBalancers": [{"containerPort": 8080}]}
+        assert _validate_port_mappings(td, svc) is None
+
+    def test_no_load_balancers_returns_none(self):
+        td = {"containerDefinitions": [{"portMappings": [{"containerPort": 8080}]}]}
+        svc = {"loadBalancers": []}
+        assert _validate_port_mappings(td, svc) is None

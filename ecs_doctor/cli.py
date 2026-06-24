@@ -283,6 +283,7 @@ def diagnose(
             elb_client=elb_client,
             cw_client=cw_client,
             request=request,
+            ec2_client=_ec2_client,
             include_metrics=not skip_metrics,
             include_config=not skip_config,
         )
@@ -319,6 +320,7 @@ def browse() -> None:
     logs_client = session.client("logs", region_name=effective_region)
     elb_client = session.client("elbv2", region_name=effective_region)
     cw_client = session.client("cloudwatch", region_name=effective_region)
+    ec2_client = session.client("ec2", region_name=effective_region)
 
     request = DiagnosisRequest(
         cluster=params["cluster"],
@@ -339,6 +341,7 @@ def browse() -> None:
         elb_client=elb_client,
         cw_client=cw_client,
         request=request,
+        ec2_client=ec2_client,
     )
 
     if output_json:

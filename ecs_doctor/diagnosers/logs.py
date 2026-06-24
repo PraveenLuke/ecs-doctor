@@ -8,6 +8,7 @@ from ecs_doctor._aws import ServiceDataCache, _AccessDeniedCached, iam_finding, 
 from ecs_doctor.models import Finding, FindingType, Severity
 
 _AWSLOGS_DRIVER = "awslogs"
+_FIRELENS_DRIVER = "awsfirelens"
 _MAX_LOG_LINES = 200
 
 # (regex pattern, human label, severity, finding_type)
@@ -46,6 +47,26 @@ CRASH_PATTERNS: list[tuple[str, str, Severity, FindingType]] = [
     (r"disk quota exceeded",                 "Disk quota exceeded",        Severity.HIGH,     FindingType.DISK_ERROR),
     # EFS / NFS mounts
     (r"mount\.nfs:.*failed|nfs: server.*not responding", "EFS/NFS mount failure", Severity.CRITICAL, FindingType.EFS_MOUNT_FAILURE),
+    # Port conflicts — app cannot bind (CRITICAL, startup is blocked completely)
+    (r"address already in use|bind: address already in use|EADDRINUSE", "Port already in use", Severity.CRITICAL, FindingType.PORT_CONFLICT),
+    # File descriptor exhaustion
+    (r"Too many open files|EMFILE", "File descriptor limit exhausted", Severity.HIGH, FindingType.LOG_CRASH_SIGNATURE),
+    # Network timeout variants (distinct from connection refused)
+    (r"Connection timed out", "Connection timed out", Severity.MEDIUM, FindingType.LOG_CRASH_SIGNATURE),
+    (r"context deadline exceeded", "gRPC/HTTP client deadline exceeded", Severity.MEDIUM, FindingType.LOG_CRASH_SIGNATURE),
+    # JVM-specific OOM (more actionable than generic "out of memory")
+    (r"java\.lang\.OutOfMemoryError: Java heap space", "JVM heap exhausted", Severity.CRITICAL, FindingType.OOM_KILLED),
+    (r"java\.lang\.OutOfMemoryError: Metaspace", "JVM Metaspace exhausted", Severity.HIGH, FindingType.LOG_CRASH_SIGNATURE),
+    # AWS SDK runtime auth errors at application level
+    (r"AccessDeniedException|is not authorized to perform", "AWS SDK permission error at runtime", Severity.HIGH, FindingType.LOG_CRASH_SIGNATURE),
+    (r"ThrottlingException|RequestLimitExceeded", "AWS API throttled", Severity.MEDIUM, FindingType.LOG_CRASH_SIGNATURE),
+    # Database contention
+    (r"database is locked", "SQLite contention", Severity.HIGH, FindingType.LOG_CRASH_SIGNATURE),
+    (r"max connections|too many connections", "DB connection pool exhausted", Severity.HIGH, FindingType.LOG_CRASH_SIGNATURE),
+    # TLS verification (supplementing existing "certificate.*expired|SSL.*error")
+    (r"certificate verify failed|CERTIFICATE_VERIFY_FAILED", "TLS certificate verification failed", Severity.MEDIUM, FindingType.LOG_CRASH_SIGNATURE),
+    # DNS alternate phrasing
+    (r"unable to resolve host", "DNS resolution failed", Severity.MEDIUM, FindingType.LOG_CRASH_SIGNATURE),
 ]
 
 _COMPILED: list[tuple[re.Pattern, str, Severity, FindingType]] = [
@@ -58,6 +79,26 @@ def _extract_context(lines: list[str], match_idx: int, context: int = 2) -> str:
     start = max(0, match_idx - context)
     end = min(len(lines), match_idx + context + 1)
     return "\n".join(lines[start:end])
+
+
+def _check_firelens(container_defs: list[dict]) -> list[Finding]:
+    """Return advisory findings for containers using the awsfirelens log driver."""
+    findings: list[Finding] = []
+    for c in container_defs:
+        lc = c.get("logConfiguration", {})
+        if lc.get("logDriver") == _FIRELENS_DRIVER:
+            findings.append(Finding(
+                type=FindingType.FIRELENS_LOG_DRIVER,
+                message=(
+                    f"Container '{c.get('name', 'unknown')}' uses FireLens (awsfirelens) log routing. "
+                    "ecs-doctor cannot scan logs not sent directly to CloudWatch Logs. "
+                    "Check the FireLens destination (S3, Kinesis, third-party) for crash signatures."
+                ),
+                severity=Severity.LOW,
+                raw_data={"container": c.get("name"), "logDriver": _FIRELENS_DRIVER},
+                source="logs",
+            ))
+    return findings
 
 
 def _awslogs_configs(container_defs: list[dict], region: str) -> dict[str, dict[str, str]]:
@@ -172,11 +213,10 @@ def diagnose_logs(
         raise
 
     container_defs = td_resp.get("taskDefinition", {}).get("containerDefinitions", [])
+    findings: list[Finding] = _check_firelens(container_defs)
     log_configs = _awslogs_configs(container_defs, region)
     if not log_configs:
-        return []
-
-    findings: list[Finding] = []
+        return findings
     for task_arn in task_arns:
         task_id = task_arn.split("/")[-1]
         for container_name, cfg in log_configs.items():

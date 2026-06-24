@@ -76,6 +76,7 @@ def _run(
             logs_client=MagicMock(),
             elb_client=MagicMock(),
             cw_client=MagicMock(),
+            ec2_client=MagicMock(),
             request=request or _req(),
             include_metrics=include_metrics,
             include_config=include_config,
@@ -181,6 +182,7 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=True, include_config=False,
             )
         assert result.metrics is not None
@@ -220,6 +222,7 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=False, include_config=True,
             )
         assert result.service_config is not None
@@ -251,6 +254,50 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=False, include_config=True,
             )
         assert FindingType.INVALID_TASK_CONFIG in {f.type for f in result.all_findings}
+
+    def test_network_findings_included_in_all_findings(self):
+        net_finding = _finding(FindingType.NETWORK_CONNECTIVITY)
+        with (
+            patch(_PATCH_EVENTS, return_value=[]),
+            patch(_PATCH_STOP, return_value=([], [])),
+            patch(_PATCH_LOGS, return_value=[]),
+            patch(_PATCH_ALB, return_value=[]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(
+                "ecs_doctor.diagnosers.network.diagnose_network",
+                return_value=[net_finding],
+            ),
+        ):
+            result = run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+            )
+        assert FindingType.NETWORK_CONNECTIVITY in {f.type for f in result.all_findings}
+
+    def test_parallel_execution_all_diagnosers_called(self):
+        """Verify all six diagnosers are invoked when ec2_client is provided."""
+        with (
+            patch(_PATCH_EVENTS, return_value=[]) as mock_events,
+            patch(_PATCH_STOP, return_value=([], [])) as mock_stop,
+            patch(_PATCH_LOGS, return_value=[]) as mock_logs,
+            patch(_PATCH_ALB, return_value=[]) as mock_alb,
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch("ecs_doctor.diagnosers.network.diagnose_network", return_value=[]) as mock_net,
+        ):
+            run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+            )
+        mock_events.assert_called_once()
+        mock_stop.assert_called_once()
+        mock_logs.assert_called_once()
+        mock_alb.assert_called_once()
+        mock_net.assert_called_once()
