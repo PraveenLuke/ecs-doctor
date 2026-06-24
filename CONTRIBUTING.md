@@ -1,8 +1,8 @@
-# Contributing to ecs-task-doctor
+# Contributing to ecs-doctor
 
 ## Origin
 
-`ecs-task-doctor` was designed and originally authored by **Praveen Rajkoilraj** ([@praveenrajkoilraj](https://github.com/praveenrajkoilraj)).
+`ecs-doctor` was designed and originally authored by **Praveen Rajkoilraj** ([@PraveenLuke](https://github.com/PraveenLuke)).
 
 If you fork this project or build on it, the MIT License requires you to preserve the copyright notice in [LICENSE](LICENSE). That notice names the original author and must remain intact in all copies and derivative works.
 
@@ -28,8 +28,8 @@ If you add a new `FindingType`, also add a corresponding entry to `_HYPOTHESIS` 
 ## Development setup
 
 ```bash
-git clone https://github.com/praveenrajkoilraj/ecs-task-doctor
-cd ecs-task-doctor
+git clone https://github.com/PraveenLuke/ecs-doctor
+cd ecs-doctor
 pip install -e ".[dev]"
 pytest tests/ -v
 ```

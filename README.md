@@ -15,7 +15,7 @@ pipx install ecs-doctor
 ecs-doctor diagnose --cluster prod --service payments
 ```
 
-![ECS Doctor demo output](docs/demo.svg)
+![ECS Doctor demo output](docs/demo.gif)
 
 ---
 
