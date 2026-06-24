@@ -11,7 +11,7 @@ from ecs_doctor.diagnosers.metrics import (
     _safe_avg,
     diagnose_metrics,
 )
-from ecs_doctor.models import FindingType, MetricSnapshot
+from ecs_doctor.models import FindingType, MetricSnapshot, Severity
 
 
 def _make_cw(**method_returns):
@@ -190,3 +190,57 @@ class TestDiagnoseMetrics:
         _, snapshot = self._call(cw)
         assert len(snapshot.cpu_datapoints) == 1
         assert len(snapshot.memory_datapoints) == 1
+
+
+# ---------------------------------------------------------------------------
+# Memory max spike check
+# ---------------------------------------------------------------------------
+
+def test_memory_max_spike_produces_high_finding():
+    snapshot = MetricSnapshot(
+        cluster=CLUSTER,
+        service=SERVICE,
+        period_seconds=300,
+        lookback_hours=3,
+        cpu_avg_percent=20.0,
+        cpu_max_percent=25.0,
+        memory_avg_percent=70.0,   # avg below CRITICAL threshold
+        memory_max_percent=96.0,   # max above spike threshold (95%)
+    )
+    findings = _anomaly_findings(snapshot, CLUSTER, SERVICE)
+    assert any(f.type == FindingType.HIGH_MEMORY_UTILIZATION for f in findings)
+    f = next(x for x in findings if x.type == FindingType.HIGH_MEMORY_UTILIZATION)
+    assert f.severity == Severity.HIGH
+    assert "96" in f.message or "spike" in f.message.lower()
+
+
+def test_no_spike_when_avg_already_critical():
+    snapshot = MetricSnapshot(
+        cluster=CLUSTER,
+        service=SERVICE,
+        period_seconds=300,
+        lookback_hours=3,
+        cpu_avg_percent=20.0,
+        cpu_max_percent=25.0,
+        memory_avg_percent=90.0,   # avg already over CRITICAL threshold
+        memory_max_percent=97.0,   # also above spike threshold
+    )
+    findings = _anomaly_findings(snapshot, CLUSTER, SERVICE)
+    mem_findings = [f for f in findings if f.type == FindingType.HIGH_MEMORY_UTILIZATION]
+    assert len(mem_findings) == 1         # only one finding, not two
+    assert mem_findings[0].severity == Severity.CRITICAL
+
+
+def test_max_below_spike_threshold_no_extra_finding():
+    snapshot = MetricSnapshot(
+        cluster=CLUSTER,
+        service=SERVICE,
+        period_seconds=300,
+        lookback_hours=3,
+        cpu_avg_percent=None,
+        cpu_max_percent=None,
+        memory_avg_percent=60.0,   # below alert threshold
+        memory_max_percent=80.0,   # below spike threshold
+    )
+    findings = _anomaly_findings(snapshot, CLUSTER, SERVICE)
+    assert findings == []

@@ -248,3 +248,35 @@ def test_target_invalid_state_produces_medium_finding():
     assert any(f.type == FindingType.ALB_UNHEALTHY for f in findings)
     f = next(x for x in findings if x.type == FindingType.ALB_UNHEALTHY)
     assert f.severity == Severity.MEDIUM
+
+
+# ---------------------------------------------------------------------------
+# Target.DeregistrationInProgress — low advisory
+# ---------------------------------------------------------------------------
+
+def test_deregistration_in_progress_produces_low_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unused", reason="Target.DeregistrationInProgress")
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.HEALTH_CHECK_FAIL for f in findings)
+    f = next(x for x in findings if x.type == FindingType.HEALTH_CHECK_FAIL)
+    assert f.severity == Severity.LOW
+    assert "deregist" in f.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Unused target with no reason — not attached to listener rule
+# ---------------------------------------------------------------------------
+
+def test_unused_no_reason_produces_low_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unused", reason="")
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.HEALTH_CHECK_FAIL for f in findings)
+    f = next(x for x in findings if x.type == FindingType.HEALTH_CHECK_FAIL)
+    assert f.severity == Severity.LOW
+    assert "unused" in f.message.lower() or "listener" in f.message.lower()

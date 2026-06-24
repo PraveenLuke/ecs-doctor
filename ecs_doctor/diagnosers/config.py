@@ -207,6 +207,71 @@ def _validate_fargate_cpu_memory(td: dict) -> Finding | None:
     return None
 
 
+def _validate_circuit_breaker(svc: dict) -> Finding | None:
+    """Return a finding when the deployment circuit breaker is disabled."""
+    dc = svc.get("deploymentConfiguration", {})
+    cb = dc.get("deploymentCircuitBreaker", {})
+    if not cb.get("enable", False):
+        return Finding(
+            type=FindingType.CIRCUIT_BREAKER_DISABLED,
+            message=(
+                "Deployment circuit breaker is disabled. "
+                "Failed deployments will not auto-rollback, leaving the service stuck in a bad state."
+            ),
+            severity=Severity.LOW,
+            raw_data={"deploymentCircuitBreaker": cb},
+            source=_SOURCE,
+        )
+    return None
+
+
+def _validate_log_config(td: dict) -> Finding | None:
+    """Return a finding when any container has no logConfiguration."""
+    containers_without_logs = [
+        c.get("name", "unknown")
+        for c in td.get("containerDefinitions", [])
+        if not c.get("logConfiguration")
+    ]
+    if containers_without_logs:
+        return Finding(
+            type=FindingType.MISSING_LOG_CONFIG,
+            message=(
+                f"Container(s) {containers_without_logs} have no logConfiguration. "
+                "stdout/stderr output will be lost — crash diagnostics become impossible."
+            ),
+            severity=Severity.HIGH,
+            raw_data={"containers": containers_without_logs},
+            source=_SOURCE,
+        )
+    return None
+
+
+def _validate_memory_limits(td: dict) -> Finding | None:
+    """Return a finding for EC2 containers with no memory or memoryReservation set."""
+    requires = td.get("requiresCompatibilities", [])
+    if "FARGATE" in requires:
+        return None
+
+    unlimited = [
+        c.get("name", "unknown")
+        for c in td.get("containerDefinitions", [])
+        if c.get("memory") is None and c.get("memoryReservation") is None
+    ]
+    if unlimited:
+        return Finding(
+            type=FindingType.INVALID_TASK_CONFIG,
+            message=(
+                f"Container(s) {unlimited} on EC2 launch type have neither memory nor "
+                "memoryReservation set. An unbounded container can consume all host memory "
+                "and OOM-kill every task on the instance."
+            ),
+            severity=Severity.MEDIUM,
+            raw_data={"containers": unlimited},
+            source=_SOURCE,
+        )
+    return None
+
+
 def diagnose_config(
     service_cache: ServiceDataCache,
     ecs_client,
@@ -253,6 +318,9 @@ def diagnose_config(
         _validate_execution_role(td),
         _validate_health_check_grace(td, svc),
         _validate_port_mappings(td, svc),
+        _validate_circuit_breaker(svc),
+        _validate_log_config(td),
+        _validate_memory_limits(td),
     ):
         if validator_result:
             findings.append(validator_result)

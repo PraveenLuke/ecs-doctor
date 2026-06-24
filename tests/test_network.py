@@ -270,3 +270,105 @@ def test_nacl_allow_produces_no_finding():
     )
     findings = _call(ecs, ec2)
     assert not any(f.type == FindingType.NETWORK_ACL_DENY for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# SG ingress check
+# ---------------------------------------------------------------------------
+
+def _svc_with_lb(subnets=None, sgs=None, container_port=8080, assign_public_ip=None):
+    awsvpc: dict = {
+        "subnets": subnets or [_SUBNET_ID],
+        "securityGroups": sgs or [_SG_ID],
+    }
+    if assign_public_ip is not None:
+        awsvpc["assignPublicIp"] = assign_public_ip
+    return {
+        "services": [
+            {
+                "networkConfiguration": {"awsvpcConfiguration": awsvpc},
+                "loadBalancers": [{"containerPort": container_port}],
+            }
+        ]
+    }
+
+
+def _sg_with_ingress(port=8080, has_ingress=True):
+    ingress = (
+        [{"IpProtocol": "tcp", "FromPort": port, "ToPort": port, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        if has_ingress
+        else []
+    )
+    return {
+        "SecurityGroups": [
+            {
+                "GroupId": _SG_ID,
+                "IpPermissions": ingress,
+                "IpPermissionsEgress": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+            }
+        ]
+    }
+
+
+def test_sg_ingress_blocked_produces_finding():
+    ecs = make_ecs_client(describe_services=_svc_with_lb())
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=False),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.SG_INGRESS_BLOCKED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.SG_INGRESS_BLOCKED)
+    assert f.severity == Severity.HIGH
+    assert "8080" in f.message
+
+
+def test_sg_ingress_allowed_no_finding():
+    ecs = make_ecs_client(describe_services=_svc_with_lb())
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert not any(f.type == FindingType.SG_INGRESS_BLOCKED for f in findings)
+
+
+def test_sg_ingress_skipped_when_no_lb_port():
+    ecs = make_ecs_client(describe_services=_svc())  # no loadBalancers
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=False),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert not any(f.type == FindingType.SG_INGRESS_BLOCKED for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Public IP assignment check
+# ---------------------------------------------------------------------------
+
+def test_public_ip_disabled_in_public_subnet_produces_finding():
+    ecs = make_ecs_client(describe_services=_svc_with_lb(assign_public_ip="DISABLED"))
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=False, has_igw=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)
+    f = next(x for x in findings if x.type == FindingType.NETWORK_CONNECTIVITY)
+    assert "public" in f.message.lower() or "NAT" in f.message or "assignPublicIp" in f.message
+
+
+def test_public_ip_enabled_in_public_subnet_no_finding():
+    ecs = make_ecs_client(describe_services=_svc_with_lb(assign_public_ip="ENABLED"))
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=False, has_igw=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert not any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)

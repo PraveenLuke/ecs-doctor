@@ -51,6 +51,12 @@ class FindingType(str, Enum):
     # network.py
     NETWORK_CONNECTIVITY = "network_connectivity"
     NETWORK_ACL_DENY = "network_acl_deny"
+    SG_INGRESS_BLOCKED = "sg_ingress_blocked"
+    # stop_reasons.py
+    DEPENDENCY_FAILED = "dependency_failed"
+    # config.py
+    CIRCUIT_BREAKER_DISABLED = "circuit_breaker_disabled"
+    MISSING_LOG_CONFIG = "missing_log_config"
     # shared
     IAM_DENIED = "iam_access_denied"
 

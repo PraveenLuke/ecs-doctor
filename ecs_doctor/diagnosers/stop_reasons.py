@@ -9,6 +9,7 @@ from ecs_doctor.models import Finding, FindingType, Severity
 
 _OOM_EXIT_CODES: frozenset[int] = frozenset({137, 139})
 _SIGTERM_EXIT_CODE = 143
+_EXIT_SIGILL = 132
 _EXIT_NOT_EXECUTABLE = 126
 _EXIT_COMMAND_NOT_FOUND = 127
 _STOPPED_STATUS = "STOPPED"
@@ -82,6 +83,7 @@ def _classify_container(
     reason: str,
     stopped_reason: str,
     task_arn: str,
+    essential: bool = True,
 ) -> tuple[tuple, dict] | None:
     """Return (bucket_key, entry) for a single container observation, or None.
 
@@ -149,6 +151,23 @@ def _classify_container(
                 "message": (
                     f"Container '{name}' exited with code 127 — command or binary not found. "
                     "Verify the CMD/ENTRYPOINT path exists inside the image and is on PATH."
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_SIGILL:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 132 (SIGILL) — "
+                    "likely an image built for a different CPU architecture "
+                    "(e.g. ARM image on x86, or AVX2 instruction on older vCPU)."
                 ),
             },
         )
@@ -224,6 +243,33 @@ def _classify_container(
             },
         )
 
+    return _check_dependency_failed(name, exit_code, lower_reason, essential, stopped_reason, task_arn)
+
+
+def _check_dependency_failed(
+    name: str,
+    exit_code: int | None,
+    lower_reason: str,
+    essential: bool,
+    stopped_reason: str,
+    task_arn: str,
+) -> tuple[tuple, dict] | None:
+    """Detect containers that stopped because a dependsOn HEALTHY condition was never met."""
+    if exit_code is None and not lower_reason and not essential:
+        return (
+            (FindingType.DEPENDENCY_FAILED, name, None),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": None,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.LOW,
+                "message": (
+                    f"Container '{name}' stopped with no exit code and no reason — "
+                    "a dependsOn condition (HEALTHY) may never have been satisfied by a sidecar."
+                ),
+            },
+        )
     return None
 
 
@@ -314,6 +360,7 @@ def diagnose_stop_reasons(
                 reason=container.get("reason", ""),
                 stopped_reason=stopped_reason,
                 task_arn=task_arn,
+                essential=container.get("essential", True),
             )
             if result:
                 key, entry = result

@@ -13,7 +13,8 @@ _DEFAULT_PERIOD = 300
 _DEFAULT_LOOKBACK_HOURS = 3
 _CPU_ALERT_THRESHOLD = 85.0
 _MEMORY_ALERT_THRESHOLD = 85.0
-_MEMORY_CRITICAL_THRESHOLD = 85.0  # memory ≥85% → CRITICAL (OOM kill imminent)
+_MEMORY_CRITICAL_THRESHOLD = 85.0
+_MEMORY_MAX_THRESHOLD = 95.0
 
 
 def _build_metric_queries(
@@ -129,6 +130,26 @@ def _anomaly_findings(snapshot: MetricSnapshot, cluster: str, service: str) -> l
                 "OOM kill risk is elevated."
             ),
             severity=Severity.CRITICAL,
+            raw_data={
+                "memory_avg_percent": snapshot.memory_avg_percent,
+                "memory_max_percent": snapshot.memory_max_percent,
+                "lookback_hours": snapshot.lookback_hours,
+            },
+            source="metrics",
+        ))
+    elif (
+        snapshot.memory_max_percent is not None
+        and snapshot.memory_max_percent >= _MEMORY_MAX_THRESHOLD
+    ):
+        findings.append(Finding(
+            type=FindingType.HIGH_MEMORY_UTILIZATION,
+            message=(
+                f"Memory utilization spiked to {snapshot.memory_max_percent:.1f}% "
+                f"(spike threshold: {_MEMORY_MAX_THRESHOLD}%) over the last "
+                f"{snapshot.lookback_hours}h for {cluster}/{service}. "
+                "A transient spike this high can trigger an OOM kill."
+            ),
+            severity=Severity.HIGH,
             raw_data={
                 "memory_avg_percent": snapshot.memory_avg_percent,
                 "memory_max_percent": snapshot.memory_max_percent,

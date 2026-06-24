@@ -23,6 +23,7 @@ _PATCH_STOP = "ecs_doctor.engine.diagnose_stop_reasons"
 _PATCH_LOGS = "ecs_doctor.engine.diagnose_logs"
 _PATCH_ALB = "ecs_doctor.engine.diagnose_alb_health"
 _PATCH_AGG = "ecs_doctor.engine.aggregate"
+_PATCH_NETWORK = "ecs_doctor.diagnosers.network.diagnose_network"
 
 
 def _req():
@@ -70,6 +71,7 @@ def _run(
         patch(_PATCH_LOGS, return_value=logs or []),
         patch(_PATCH_ALB, return_value=alb or []),
         patch(_PATCH_AGG, return_value=_root_cause()),
+        patch(_PATCH_NETWORK, return_value=[]),
     ):
         return run_diagnosis(
             ecs_client=MagicMock(),

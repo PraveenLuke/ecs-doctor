@@ -13,6 +13,7 @@ _SOURCE = "network"
 _NACL_DENY = "deny"
 _NACL_EGRESS = True
 _ECR_ENDPOINT_SUFFIXES = frozenset({"ecr.api", "ecr.dkr", "s3"})
+_SUBNET_ASSOC_FILTER = "association.subnet-id"
 
 
 def _has_outbound_internet(routes: list[dict]) -> bool:
@@ -52,7 +53,7 @@ def _check_nacl(ec2_client, subnet_id: str, region: str, account_id: str) -> Fin
     """Return a finding if a NACL explicitly denies outbound traffic on port 443 or 80."""
     try:
         resp = ec2_client.describe_network_acls(
-            Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+            Filters=[{"Name": _SUBNET_ASSOC_FILTER, "Values": [subnet_id]}]
         )
     except ClientError as exc:
         if is_access_denied(exc):
@@ -92,7 +93,7 @@ def _check_subnet_egress(ec2_client, subnet_id: str, region: str, account_id: st
     """Check if the subnet has a route to the internet."""
     try:
         resp = ec2_client.describe_route_tables(
-            Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}]
+            Filters=[{"Name": _SUBNET_ASSOC_FILTER, "Values": [subnet_id]}]
         )
     except ClientError as exc:
         if is_access_denied(exc):
@@ -189,6 +190,138 @@ def _get_task_network_details(
     return subnet_ids, sg_ids
 
 
+def _rule_allows_port(rule: dict, port: int) -> bool:
+    """Return True if a SG IpPermissions entry permits inbound traffic on port."""
+    proto = rule.get("IpProtocol", "")
+    has_source = bool(rule.get("IpRanges") or rule.get("UserIdGroupPairs") or rule.get("Ipv6Ranges"))
+    if proto == "-1":
+        return has_source
+    try:
+        from_port = int(rule.get("FromPort", 0))
+        to_port = int(rule.get("ToPort", 0))
+    except (TypeError, ValueError):
+        return False
+    return has_source and from_port <= port <= to_port
+
+
+def _check_sg_ingress(
+    ec2_client,
+    sg_ids: list[str],
+    container_port: int | None,
+    region: str,
+    account_id: str,
+) -> Finding | None:
+    """Return a finding if no task SG allows inbound traffic on container_port."""
+    if not sg_ids or container_port is None:
+        return None
+    try:
+        resp = ec2_client.describe_security_groups(GroupIds=sg_ids)
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return iam_finding(
+                "ec2:DescribeSecurityGroups",
+                f"arn:aws:ec2:{region}:{account_id}:security-group/*",
+                _SOURCE,
+            )
+        raise
+
+    for group in resp.get("SecurityGroups", []):
+        for rule in group.get("IpPermissions", []):
+            if _rule_allows_port(rule, container_port):
+                return None
+
+    return Finding(
+        type=FindingType.SG_INGRESS_BLOCKED,
+        message=(
+            f"No task security group allows inbound traffic on port {container_port}. "
+            "The ALB or other callers cannot reach the container. "
+            f"Add an inbound rule on port {container_port} to: {', '.join(sg_ids)}."
+        ),
+        severity=Severity.HIGH,
+        raw_data={"sg_ids": sg_ids, "container_port": container_port},
+        source=_SOURCE,
+    )
+
+
+def _check_public_ip_assignment(
+    ec2_client,
+    svc: dict,
+    subnet_ids: list[str],
+) -> Finding | None:
+    """Return a finding when assignPublicIp=DISABLED but the subnet routes via IGW (no NAT)."""
+    network_config = svc.get("networkConfiguration", {}).get("awsvpcConfiguration", {})
+    if network_config.get("assignPublicIp", "") != "DISABLED":
+        return None
+    if not subnet_ids:
+        return None
+    try:
+        resp = ec2_client.describe_route_tables(
+            Filters=[{"Name": _SUBNET_ASSOC_FILTER, "Values": [subnet_ids[0]]}]
+        )
+    except ClientError:
+        return None
+
+    for rt in resp.get("RouteTables", []):
+        routes = rt.get("Routes", [])
+        has_igw = any(r.get("GatewayId", "").startswith(_INTERNET_GATEWAY_PREFIX) for r in routes)
+        has_nat = any(r.get("NatGatewayId", "").startswith(_NAT_GATEWAY_PREFIX) for r in routes)
+        if has_igw and not has_nat:
+            return Finding(
+                type=FindingType.NETWORK_CONNECTIVITY,
+                message=(
+                    "Service has assignPublicIp=DISABLED but the task subnet routes through an "
+                    "Internet Gateway without a NAT Gateway. Tasks have no public IP and no NAT — "
+                    "they cannot reach the internet or AWS service endpoints."
+                ),
+                severity=Severity.HIGH,
+                raw_data={"assign_public_ip": "DISABLED", "subnet_id": subnet_ids[0]},
+                source=_SOURCE,
+            )
+    return None
+
+
+def _run_network_checks(
+    ec2_client,
+    svc: dict,
+    subnet_ids: list[str],
+    sg_ids: list[str],
+    region: str,
+    account_id: str,
+) -> list[Finding]:
+    """Run all per-subnet, per-SG, and service-level network checks."""
+    findings: list[Finding] = []
+
+    for subnet_id in subnet_ids[:2]:
+        f = _check_subnet_egress(ec2_client, subnet_id, region, account_id)
+        if f:
+            findings.append(f)
+            break
+
+    for subnet_id in subnet_ids[:1]:
+        f = _check_nacl(ec2_client, subnet_id, region, account_id)
+        if f:
+            findings.append(f)
+
+    for sg_id in sg_ids[:2]:
+        f = _check_security_group_egress(ec2_client, sg_id, region, account_id)
+        if f:
+            findings.append(f)
+            break
+
+    load_balancers = svc.get("loadBalancers", [])
+    container_port: int | None = load_balancers[0].get("containerPort") if load_balancers else None
+
+    f = _check_sg_ingress(ec2_client, sg_ids, container_port, region, account_id)
+    if f:
+        findings.append(f)
+
+    f = _check_public_ip_assignment(ec2_client, svc, subnet_ids)
+    if f:
+        findings.append(f)
+
+    return findings
+
+
 def diagnose_network(
     service_cache: ServiceDataCache,
     ecs_client,
@@ -220,23 +353,4 @@ def diagnose_network(
     if not subnet_ids and not sg_ids:
         return []
 
-    findings: list[Finding] = []
-
-    for subnet_id in subnet_ids[:2]:
-        finding = _check_subnet_egress(ec2_client, subnet_id, region, account_id)
-        if finding:
-            findings.append(finding)
-            break
-
-    for subnet_id in subnet_ids[:1]:
-        nacl_finding = _check_nacl(ec2_client, subnet_id, region, account_id)
-        if nacl_finding:
-            findings.append(nacl_finding)
-
-    for sg_id in sg_ids[:2]:
-        finding = _check_security_group_egress(ec2_client, sg_id, region, account_id)
-        if finding:
-            findings.append(finding)
-            break
-
-    return findings
+    return _run_network_checks(ec2_client, svc, subnet_ids, sg_ids, region, account_id)

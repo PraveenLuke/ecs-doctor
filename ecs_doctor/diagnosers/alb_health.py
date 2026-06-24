@@ -101,6 +101,30 @@ def _finding_for_target(
             source="alb_health",
         )
 
+    if reason_code == "Target.DeregistrationInProgress":
+        return Finding(
+            type=FindingType.HEALTH_CHECK_FAIL,
+            message=(
+                f"Target {target_id} is deregistering — connection draining in progress. "
+                "If persistent, the task may be crash-looping and re-registering repeatedly."
+            ),
+            severity=Severity.LOW,
+            raw_data=raw,
+            source="alb_health",
+        )
+
+    if state == "unused" and not reason_code:
+        return Finding(
+            type=FindingType.HEALTH_CHECK_FAIL,
+            message=(
+                f"Target {target_id} is registered but unused — "
+                "no listener rule routes traffic to this target group."
+            ),
+            severity=Severity.LOW,
+            raw_data=raw,
+            source="alb_health",
+        )
+
     return None
 
 
