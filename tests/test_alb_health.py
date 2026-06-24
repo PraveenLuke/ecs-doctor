@@ -202,3 +202,81 @@ def test_raw_data_contains_tg_arn():
     findings = _call(ecs, elb)
     f = next(x for x in findings if x.type == FindingType.ALB_UNHEALTHY)
     assert f.raw_data["tg_arn"] == _TG_ARN
+
+
+# ---------------------------------------------------------------------------
+# Empty target group — no registered targets
+# ---------------------------------------------------------------------------
+
+def test_empty_target_group_produces_no_alb_targets_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health={"TargetHealthDescriptions": []}
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.NO_ALB_TARGETS for f in findings)
+    f = next(x for x in findings if x.type == FindingType.NO_ALB_TARGETS)
+    assert f.severity == Severity.HIGH
+    assert f.raw_data["tg_arn"] == _TG_ARN
+
+
+# ---------------------------------------------------------------------------
+# Draining state — low advisory
+# ---------------------------------------------------------------------------
+
+def test_draining_target_produces_low_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("draining")
+    )
+    findings = _call(ecs, elb)
+    draining = [f for f in findings if "draining" in f.message.lower()]
+    assert any(draining)
+    assert draining[0].severity == Severity.LOW
+
+
+# ---------------------------------------------------------------------------
+# Target.InvalidState — protocol mismatch
+# ---------------------------------------------------------------------------
+
+def test_target_invalid_state_produces_medium_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unused", reason="Target.InvalidState")
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.ALB_UNHEALTHY for f in findings)
+    f = next(x for x in findings if x.type == FindingType.ALB_UNHEALTHY)
+    assert f.severity == Severity.MEDIUM
+
+
+# ---------------------------------------------------------------------------
+# Target.DeregistrationInProgress — low advisory
+# ---------------------------------------------------------------------------
+
+def test_deregistration_in_progress_produces_low_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unused", reason="Target.DeregistrationInProgress")
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.HEALTH_CHECK_FAIL for f in findings)
+    f = next(x for x in findings if x.type == FindingType.HEALTH_CHECK_FAIL)
+    assert f.severity == Severity.LOW
+    assert "deregist" in f.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Unused target with no reason — not attached to listener rule
+# ---------------------------------------------------------------------------
+
+def test_unused_no_reason_produces_low_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unused", reason="")
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.HEALTH_CHECK_FAIL for f in findings)
+    f = next(x for x in findings if x.type == FindingType.HEALTH_CHECK_FAIL)
+    assert f.severity == Severity.LOW
+    assert "unused" in f.message.lower() or "listener" in f.message.lower()

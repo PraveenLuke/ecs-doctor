@@ -182,6 +182,57 @@ def test_deployment_deadlock_detected():
     assert deadlock.severity == Severity.CRITICAL
 
 
+# ---------------------------------------------------------------------------
+# EC2-specific placement: no container instance met requirements
+# ---------------------------------------------------------------------------
+
+def test_placement_failure_ec2_no_instance():
+    ecs = make_ecs_client(
+        describe_services=_svc_resp([
+            _event("service was unable to place a task because no container instance met all of its requirements")
+        ])
+    )
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.PLACEMENT_FAILURE for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker alternate phrases
+# ---------------------------------------------------------------------------
+
+def test_circuit_breaker_tripped():
+    ecs = make_ecs_client(
+        describe_services=_svc_resp([_event("circuit breaker has been tripped")])
+    )
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.DEPLOYMENT_ROLLBACK for f in findings)
+    f = next(x for x in findings if x.type == FindingType.DEPLOYMENT_ROLLBACK)
+    assert f.severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# Steady-state deficit: ACTIVE service with 0 running and 0 pending
+# ---------------------------------------------------------------------------
+
+def test_steady_state_deficit_zero_running():
+    svc_data = {
+        "status": "ACTIVE",
+        "events": [],
+        "desiredCount": 2,
+        "runningCount": 0,
+        "pendingCount": 0,
+        "deploymentConfiguration": {
+            "minimumHealthyPercent": 100,
+            "maximumPercent": 200,
+        },
+    }
+    ecs = make_ecs_client(describe_services={"services": [svc_data]})
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    thrash_findings = [f for f in findings if f.type == FindingType.TASK_THRASHING]
+    assert any(thrash_findings)
+    assert thrash_findings[0].severity == Severity.CRITICAL
+
+
 def test_no_deadlock_when_running_tasks_present():
     svc_data = {
         "events": [],
@@ -196,3 +247,50 @@ def test_no_deadlock_when_running_tasks_present():
     ecs = make_ecs_client(describe_services={"services": [svc_data]})
     findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
     assert not any(f.type == FindingType.DEPLOYMENT_CONFIG_DEADLOCK for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Deployment stall: IN_PROGRESS with pending tasks but zero running
+# ---------------------------------------------------------------------------
+
+def test_deployment_stall_detected():
+    svc_data = {
+        "status": "ACTIVE",
+        "events": [],
+        "desiredCount": 2,
+        "runningCount": 0,
+        "pendingCount": 0,
+        "deploymentConfiguration": {
+            "minimumHealthyPercent": 100,
+            "maximumPercent": 200,
+        },
+        "deployments": [
+            {
+                "id": "ecs-svc/1234567890",
+                "status": "IN_PROGRESS",
+                "pendingCount": 2,
+                "runningCount": 0,
+            }
+        ],
+    }
+    ecs = make_ecs_client(describe_services={"services": [svc_data]})
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.DEPLOYMENT_STALL for f in findings)
+    f = next(x for x in findings if x.type == FindingType.DEPLOYMENT_STALL)
+    assert f.severity == Severity.HIGH
+
+
+def test_no_deployment_stall_when_running_present():
+    svc_data = {
+        "events": [],
+        "desiredCount": 2,
+        "runningCount": 1,
+        "pendingCount": 0,
+        "deploymentConfiguration": {"minimumHealthyPercent": 100, "maximumPercent": 200},
+        "deployments": [
+            {"id": "ecs-svc/1234", "status": "IN_PROGRESS", "pendingCount": 0, "runningCount": 1}
+        ],
+    }
+    ecs = make_ecs_client(describe_services={"services": [svc_data]})
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert not any(f.type == FindingType.DEPLOYMENT_STALL for f in findings)

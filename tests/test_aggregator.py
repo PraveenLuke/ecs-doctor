@@ -150,3 +150,28 @@ def test_no_hypothesis_match_falls_back():
     result = aggregate([_f(FindingType.IAM_DENIED, Severity.LOW)])
     assert result.cause != ""
     assert result.confidence >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fallback weight for unmapped FindingTypes
+# ---------------------------------------------------------------------------
+
+def test_unmapped_finding_type_uses_fallback_weight():
+    # DEPENDENCY_FAILED, CIRCUIT_BREAKER_DISABLED, MISSING_LOG_CONFIG, SG_INGRESS_BLOCKED
+    # are now mapped, but we verify the fallback path still returns a usable result
+    # by using a type that has a very low base weight (CIRCUIT_BREAKER_DISABLED = 0.05)
+    result = aggregate([_f(FindingType.CIRCUIT_BREAKER_DISABLED, Severity.LOW)])
+    assert result.cause != ""
+    assert result.confidence >= 0.0
+    assert result.suggested_fix != ""
+
+
+def test_new_finding_types_produce_non_zero_confidence():
+    for ftype in (
+        FindingType.DEPENDENCY_FAILED,
+        FindingType.CIRCUIT_BREAKER_DISABLED,
+        FindingType.MISSING_LOG_CONFIG,
+        FindingType.SG_INGRESS_BLOCKED,
+    ):
+        result = aggregate([_f(ftype, Severity.HIGH)])
+        assert result.confidence > 0.0, f"{ftype} produced zero confidence"

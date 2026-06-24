@@ -77,6 +77,13 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "Review service events and logs from the new tasks that failed during deployment. "
         "Compare the failing task definition against the last known-good version.",
     ),
+    FindingType.DEPLOYMENT_STALL: (
+        "Deployment is stalled — tasks are launching but failing health checks",
+        0.75,
+        "Check ALB health check path and grace period. Tasks are starting (pendingCount > 0) "
+        "but not reaching healthy state. Review application startup logs and increase "
+        "healthCheckGracePeriodSeconds.",
+    ),
     FindingType.DEPLOYMENT_CONFIG_DEADLOCK: (
         "Deployment is deadlocked — minimumHealthyPercent/maximumPercent prevents task replacement",
         0.80,
@@ -181,6 +188,111 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "2048 CPU → 4–16 GB, 4096 CPU → 8–30 GB. "
         "Update the task definition to use a valid combination.",
     ),
+    FindingType.MISSING_EXECUTION_ROLE: (
+        "Task definition is missing executionRoleArn — ECS cannot pull images or read secrets",
+        0.90,
+        "Add an executionRoleArn to the task definition. The execution role needs "
+        "ecr:GetAuthorizationToken, ecr:BatchGetImage, logs:CreateLogStream, logs:PutLogEvents, "
+        "and secretsmanager:GetSecretValue (if using Secrets Manager). "
+        "Create or update the role in IAM and reference it in the task definition.",
+    ),
+    FindingType.CONTAINER_START_FAILURE: (
+        "Container failed to start — bad entrypoint, missing binary, or runtime start error",
+        0.85,
+        "Exit 126 means the binary exists but is not executable (check file permissions in the image). "
+        "Exit 127 means the binary was not found (check CMD/ENTRYPOINT spelling and PATH). "
+        "CannotStartContainerError means the container runtime rejected the container at startup — "
+        "check volume mounts, cgroup limits, and invalid environment variables.",
+    ),
+    FindingType.PORT_CONFLICT: (
+        "Port already in use — container cannot bind to its declared port",
+        0.90,
+        "Another process is already listening on the port. Common causes: "
+        "multiple containers in the task sharing a port without specifying different containerPort values, "
+        "a sidecar not releasing the port on restart, or the previous task not fully stopped before replacement. "
+        "Verify portMappings are unique across all containers in the task definition.",
+    ),
+    FindingType.NO_ALB_TARGETS: (
+        "No targets registered in the ALB target group — traffic is not reaching the service",
+        0.85,
+        "ECS failed to register task IPs with the target group. Common causes: "
+        "containerPort in the task definition does not match the load balancer configuration, "
+        "the task never reached RUNNING state so ECS never attempted registration, "
+        "or the target group and ECS service are in different VPCs. "
+        "Check service events for 'registration' errors.",
+    ),
+    FindingType.MISSING_PORT_MAPPING: (
+        "Load balancer expects a port that no container exposes",
+        0.80,
+        "Add the missing containerPort to the portMappings of the relevant container in the task definition. "
+        "The port declared in the service's loadBalancers configuration must match a containerPort "
+        "in the container definition. Update the task definition and redeploy.",
+    ),
+    FindingType.MISSING_HEALTH_CHECK_GRACE_PERIOD: (
+        "Health checks may be killing tasks before the application finishes starting",
+        0.60,
+        "Set healthCheckGracePeriodSeconds on the ECS service to give the application time to warm up. "
+        "A good starting value is the P95 startup time of the container plus 30 seconds. "
+        "Without grace period, ECS may terminate tasks that are still initializing.",
+    ),
+    FindingType.NETWORK_ACL_DENY: (
+        "Network ACL is blocking outbound traffic on required ports",
+        0.85,
+        "Review the NACL rules for the task's subnet. Ensure outbound ALLOW rules exist for "
+        "ports 443 (HTTPS/ECR/Secrets Manager), 80 (HTTP), and ephemeral return ports 1024–65535. "
+        "Unlike security groups, NACLs are stateless — both the outbound request and inbound response "
+        "need explicit ALLOW rules.",
+    ),
+    FindingType.SCHEDULER_REPLACED: (
+        "Task was replaced by the ECS scheduler (scale-in or deployment)",
+        0.05,
+        "This is expected behaviour during deployments or Auto Scaling scale-in events. "
+        "If unexpected, check service events for deployment activity and Auto Scaling policies.",
+    ),
+    FindingType.USER_INITIATED_STOP: (
+        "Task was manually stopped",
+        0.05,
+        "A user or automation called StopTask on this task. "
+        "This is intentional — if tasks are being stopped unexpectedly, "
+        "audit CloudTrail for ecs:StopTask events to identify the caller.",
+    ),
+    FindingType.FIRELENS_LOG_DRIVER: (
+        "FireLens log driver in use — CloudWatch log scan skipped",
+        0.05,
+        "This service uses awsfirelens (Fluent Bit/Fluentd) for log routing. "
+        "ecs-doctor cannot scan logs that are not sent to CloudWatch Logs directly. "
+        "Check the FireLens destination (S3, Kinesis, third-party) for crash signatures manually.",
+    ),
+    FindingType.DEPENDENCY_FAILED: (
+        "Container dependency condition never satisfied — dependent sidecar did not become HEALTHY",
+        0.55,
+        "Check the dependsOn configuration in the task definition. "
+        "If a sidecar is declared with condition=HEALTHY, it must pass its own HEALTHCHECK. "
+        "Verify the sidecar's health check command, interval, and startPeriod are correctly configured. "
+        "Consider relaxing the condition to START if the sidecar does not expose a health check.",
+    ),
+    FindingType.CIRCUIT_BREAKER_DISABLED: (
+        "Deployment circuit breaker is disabled — failed deployments will not auto-rollback",
+        0.05,
+        "Enable the ECS deployment circuit breaker on the service to automatically roll back "
+        "failed deployments. Set deploymentCircuitBreaker.enable=true and rollback=true in the "
+        "service's deploymentConfiguration.",
+    ),
+    FindingType.MISSING_LOG_CONFIG: (
+        "Container has no log configuration — stdout/stderr are lost",
+        0.20,
+        "Add a logConfiguration block to the container definition. "
+        "For CloudWatch Logs, use logDriver=awslogs and set awslogs-group, awslogs-region, "
+        "and awslogs-stream-prefix. Ensure the task execution role has logs:CreateLogStream "
+        "and logs:PutLogEvents permissions.",
+    ),
+    FindingType.SG_INGRESS_BLOCKED: (
+        "Security group blocks inbound traffic on the container port — ALB cannot reach the task",
+        0.90,
+        "Add an inbound rule to the task security group allowing traffic on the container port "
+        "from the ALB security group (preferred) or the VPC CIDR. "
+        "Avoid opening 0.0.0.0/0 — scope the source to the ALB security group ID instead.",
+    ),
     FindingType.IAM_DENIED: (
         "Diagnosis incomplete — IAM permissions are blocking one or more checks",
         0.50,
@@ -207,10 +319,15 @@ def aggregate(findings: list[Finding]) -> RootCause:
     evidence_map: dict[str, list[Finding]] = defaultdict(list)
     fix_map: dict[str, str] = {}
 
+    _FALLBACK_WEIGHT = 0.10
+
     for finding in findings:
         if finding.type not in _HYPOTHESIS:
-            continue
-        label, base_weight, fix = _HYPOTHESIS[finding.type]
+            label = finding.type.value.replace("_", " ").title()
+            base_weight = _FALLBACK_WEIGHT
+            fix = "Review the raw finding for details."
+        else:
+            label, base_weight, fix = _HYPOTHESIS[finding.type]
         score = base_weight * _SEVERITY_MULTIPLIER[finding.severity]
         scores[label] += score
         evidence_map[label].append(finding)

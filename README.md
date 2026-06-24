@@ -15,26 +15,7 @@ pipx install ecs-doctor
 ecs-doctor diagnose --cluster prod --service payments
 ```
 
-```
-╭─ Root Cause ──────────────────────────────────────────────────────────╮
-│  Container is being OOM-killed (out of memory)          97% confidence │
-│                                                                        │
-│  Suggested fix: Increase the container memory reservation in the task  │
-│  definition. Profile the application for memory leaks — common causes  │
-│  include unbounded caches, unclosed DB connections, JVM heap settings. │
-╰────────────────────────────────────────────────────────────────────────╯
-
-  Source        Type            Severity   Message
-  stop_reasons  oom_killed      CRITICAL   Container 'app' exit 137 (3 tasks)
-  logs          log_crash_sig   CRITICAL   OOM detected in CloudWatch Logs
-  events        task_thrashing  CRITICAL   4 starts / 4 stops in last 20 events
-
-  Metric              Average    Maximum
-  CPU Utilization      12.4%      18.1%
-  Memory Utilization   94.2%      99.8%
-
-Diagnosis completed in 843ms.
-```
+![ECS Doctor demo output](docs/demo.svg)
 
 ---
 
@@ -44,13 +25,13 @@ ECS Doctor runs **7 parallel diagnostic checks** across the AWS APIs that matter
 
 | Check | AWS APIs | What it catches |
 |-------|----------|-----------------|
-| **Service events** | `ecs:DescribeServices` | Placement failures, deployment rollbacks, crash loops, deployment config deadlock |
-| **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | OOM (exit 137/139), image pull failure, missing secret, non-zero exit, SIGTERM not handled, Spot interruption |
-| **CloudWatch Logs** | `logs:GetLogEvents` | Python / Java / Go / Node.js / Rust / .NET / PHP / Ruby crashes, DNS failures, TLS errors, wrong CPU architecture, EFS mount failures (25+ patterns) |
-| **ALB health** | `elasticloadbalancing:DescribeTargetHealth` | Unhealthy targets — timeout, connection refused, non-2xx |
-| **Metrics** | `cloudwatch:GetMetricData` | CPU or memory above 85% over the last 3 hours |
-| **Task config** | `ecs:DescribeTaskDefinition` | Invalid Fargate CPU/memory combination |
-| **Network** | `ec2:Describe*` | Security groups blocking egress, no NAT Gateway, ENI not attached |
+| **Service events** | `ecs:DescribeServices` | Why your deployment stalled, rolled back, or never reached steady state |
+| **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | Why your container stopped — OOM, bad image, missing secrets, startup failures, and more |
+| **CloudWatch Logs** | `logs:GetLogEvents` | Crash signatures across Python, Java, Go, Node.js, and 5 other runtimes — without you grepping |
+| **ALB health** | `elasticloadbalancing:DescribeTargetHealth` | Why your load balancer is dropping traffic or has no targets to send to |
+| **Metrics** | `cloudwatch:GetMetricData` | Whether CPU or memory pressure is the underlying cause, with severity-weighted thresholds |
+| **Task config** | `ecs:DescribeTaskDefinition` | Misconfiguration in your task definition or service that will silently break deployments |
+| **Network** | `ec2:Describe*` | Connectivity issues blocking your tasks from reaching AWS services or the internet |
 
 All findings are scored, ranked by confidence, and collapsed into a single root cause.
 
@@ -192,7 +173,8 @@ Minimum policy for a full scan:
       "Action": [
         "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets",
         "ec2:DescribeRouteTables", "ec2:DescribeNatGateways",
-        "ec2:DescribeNetworkInterfaces"
+        "ec2:DescribeNetworkInterfaces", "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeNetworkAcls"
       ],
       "Resource": "*"
     },

@@ -23,6 +23,7 @@ _PATCH_STOP = "ecs_doctor.engine.diagnose_stop_reasons"
 _PATCH_LOGS = "ecs_doctor.engine.diagnose_logs"
 _PATCH_ALB = "ecs_doctor.engine.diagnose_alb_health"
 _PATCH_AGG = "ecs_doctor.engine.aggregate"
+_PATCH_NETWORK = "ecs_doctor.diagnosers.network.diagnose_network"
 
 
 def _req():
@@ -70,12 +71,14 @@ def _run(
         patch(_PATCH_LOGS, return_value=logs or []),
         patch(_PATCH_ALB, return_value=alb or []),
         patch(_PATCH_AGG, return_value=_root_cause()),
+        patch(_PATCH_NETWORK, return_value=[]),
     ):
         return run_diagnosis(
             ecs_client=MagicMock(),
             logs_client=MagicMock(),
             elb_client=MagicMock(),
             cw_client=MagicMock(),
+            ec2_client=MagicMock(),
             request=request or _req(),
             include_metrics=include_metrics,
             include_config=include_config,
@@ -181,6 +184,7 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=True, include_config=False,
             )
         assert result.metrics is not None
@@ -220,6 +224,7 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=False, include_config=True,
             )
         assert result.service_config is not None
@@ -251,6 +256,77 @@ class TestRunDiagnosis:
             result = run_diagnosis(
                 ecs_client=MagicMock(), logs_client=MagicMock(),
                 elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
                 request=_req(), include_metrics=False, include_config=True,
             )
         assert FindingType.INVALID_TASK_CONFIG in {f.type for f in result.all_findings}
+
+    def test_network_findings_included_in_all_findings(self):
+        net_finding = _finding(FindingType.NETWORK_CONNECTIVITY)
+        with (
+            patch(_PATCH_EVENTS, return_value=[]),
+            patch(_PATCH_STOP, return_value=([], [])),
+            patch(_PATCH_LOGS, return_value=[]),
+            patch(_PATCH_ALB, return_value=[]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(
+                "ecs_doctor.diagnosers.network.diagnose_network",
+                return_value=[net_finding],
+            ),
+        ):
+            result = run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+            )
+        assert FindingType.NETWORK_CONNECTIVITY in {f.type for f in result.all_findings}
+
+    def test_parallel_execution_all_diagnosers_called(self):
+        """Verify all six diagnosers are invoked when ec2_client is provided."""
+        with (
+            patch(_PATCH_EVENTS, return_value=[]) as mock_events,
+            patch(_PATCH_STOP, return_value=([], [])) as mock_stop,
+            patch(_PATCH_LOGS, return_value=[]) as mock_logs,
+            patch(_PATCH_ALB, return_value=[]) as mock_alb,
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch("ecs_doctor.diagnosers.network.diagnose_network", return_value=[]) as mock_net,
+        ):
+            run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+            )
+        mock_events.assert_called_once()
+        mock_stop.assert_called_once()
+        mock_logs.assert_called_once()
+        mock_alb.assert_called_once()
+        mock_net.assert_called_once()
+
+    def test_diagnoser_exception_isolated(self):
+        """A future that raises should produce one IAM_DENIED LOW instead of crashing."""
+        from concurrent.futures import Future
+
+        def _raise():
+            raise RuntimeError("simulated AWS error")
+
+        with (
+            patch(_PATCH_EVENTS, side_effect=RuntimeError("events fail")),
+            patch(_PATCH_STOP, return_value=([], [])),
+            patch(_PATCH_LOGS, return_value=[]),
+            patch(_PATCH_ALB, return_value=[_finding(FindingType.ALB_UNHEALTHY)]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(_PATCH_NETWORK, return_value=[]),
+        ):
+            result = run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+            )
+        types = {f.type for f in result.all_findings}
+        assert FindingType.IAM_DENIED in types
+        assert FindingType.ALB_UNHEALTHY in types
+        error_findings = [f for f in result.all_findings if f.type == FindingType.IAM_DENIED]
+        assert all(f.severity == Severity.LOW for f in error_findings)

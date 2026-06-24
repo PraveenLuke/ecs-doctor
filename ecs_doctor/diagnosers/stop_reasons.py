@@ -9,9 +9,14 @@ from ecs_doctor.models import Finding, FindingType, Severity
 
 _OOM_EXIT_CODES: frozenset[int] = frozenset({137, 139})
 _SIGTERM_EXIT_CODE = 143
+_EXIT_SIGILL = 132
+_EXIT_NOT_EXECUTABLE = 126
+_EXIT_COMMAND_NOT_FOUND = 127
 _STOPPED_STATUS = "STOPPED"
 _ESSENTIAL_LOWER = "essential container"
 _CANNOT_PULL_LOWER = "cannotpullcontainererror"
+_CANNOT_START_LOWER = "cannotstartcontainererror"
+_DEPENDS_ON_LOWER = "dependent container"
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +43,14 @@ _TASK_STOP_CODE_MAP: dict[str, tuple[FindingType, str]] = {
     "EssentialContainerExited": (
         FindingType.ESSENTIAL_EXITED,
         "Essential container exited (task-level stopCode). stoppedReason: {reason}",
+    ),
+    "ServiceSchedulerInitiated": (
+        FindingType.SCHEDULER_REPLACED,
+        "Task replaced by ECS scheduler (scale-in or deployment). stoppedReason: {reason}",
+    ),
+    "UserInitiated": (
+        FindingType.USER_INITIATED_STOP,
+        "Task was manually stopped. stoppedReason: {reason}",
     ),
 }
 
@@ -71,6 +84,7 @@ def _classify_container(
     reason: str,
     stopped_reason: str,
     task_arn: str,
+    essential: bool = True,
 ) -> tuple[tuple, dict] | None:
     """Return (bucket_key, entry) for a single container observation, or None.
 
@@ -90,6 +104,72 @@ def _classify_container(
                 "stoppedReason": stopped_reason,
                 "severity": Severity.CRITICAL,
                 "message": f"Container '{name}' could not pull image. Reason: {reason or stopped_reason}",
+            },
+        )
+
+    if _CANNOT_START_LOWER in lower_reason:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, None),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "reason": reason,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.CRITICAL,
+                "message": (
+                    f"Container '{name}' failed to start (CannotStartContainerError). "
+                    "Check volume mounts, cgroup limits, and entrypoint configuration. "
+                    f"Reason: {reason}"
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_NOT_EXECUTABLE:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 126 — entrypoint or command is not executable. "
+                    "Check file permissions on the binary inside the image (chmod +x)."
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_COMMAND_NOT_FOUND:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 127 — command or binary not found. "
+                    "Verify the CMD/ENTRYPOINT path exists inside the image and is on PATH."
+                ),
+            },
+        )
+
+    if exit_code == _EXIT_SIGILL:
+        return (
+            (FindingType.CONTAINER_START_FAILURE, name, exit_code),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": exit_code,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.HIGH,
+                "message": (
+                    f"Container '{name}' exited with code 132 (SIGILL) — "
+                    "likely an image built for a different CPU architecture "
+                    "(e.g. ARM image on x86, or AVX2 instruction on older vCPU)."
+                ),
             },
         )
 
@@ -151,6 +231,10 @@ def _classify_container(
             },
         )
 
+    depends_on_result = _check_depends_on_healthy(name, exit_code, lower_reason, stopped_reason, task_arn)
+    if depends_on_result:
+        return depends_on_result
+
     if _ESSENTIAL_LOWER in lower_stopped:
         return (
             (FindingType.ESSENTIAL_EXITED, name, None),
@@ -164,6 +248,59 @@ def _classify_container(
             },
         )
 
+    return _check_dependency_failed(name, exit_code, lower_reason, essential, stopped_reason, task_arn)
+
+
+def _check_depends_on_healthy(
+    name: str,
+    exit_code: int | None,
+    lower_reason: str,
+    stopped_reason: str,
+    task_arn: str,
+) -> tuple[tuple, dict] | None:
+    """Detect essential containers stopped because a dependsOn HEALTHY reason was present."""
+    if exit_code is None and _DEPENDS_ON_LOWER in lower_reason:
+        return (
+            (FindingType.DEPENDENCY_FAILED, name, None),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": None,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.MEDIUM,
+                "message": (
+                    f"Container '{name}' stopped because a dependsOn HEALTHY condition "
+                    f"was never satisfied. Reason: {stopped_reason}"
+                ),
+            },
+        )
+    return None
+
+
+def _check_dependency_failed(
+    name: str,
+    exit_code: int | None,
+    lower_reason: str,
+    essential: bool,
+    stopped_reason: str,
+    task_arn: str,
+) -> tuple[tuple, dict] | None:
+    """Detect containers that stopped because a dependsOn HEALTHY condition was never met."""
+    if exit_code is None and not lower_reason and not essential:
+        return (
+            (FindingType.DEPENDENCY_FAILED, name, None),
+            {
+                "taskArn": task_arn,
+                "containerName": name,
+                "exitCode": None,
+                "stoppedReason": stopped_reason,
+                "severity": Severity.LOW,
+                "message": (
+                    f"Container '{name}' stopped with no exit code and no reason — "
+                    "a dependsOn condition (HEALTHY) may never have been satisfied by a sidecar."
+                ),
+            },
+        )
     return None
 
 
@@ -254,6 +391,7 @@ def diagnose_stop_reasons(
                 reason=container.get("reason", ""),
                 stopped_reason=stopped_reason,
                 task_arn=task_arn,
+                essential=container.get("essential", True),
             )
             if result:
                 key, entry = result

@@ -253,3 +253,137 @@ def test_task_arns_returned():
     )
     _, arns = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
     assert arns == [_TASK_ARN]
+
+
+# ---------------------------------------------------------------------------
+# Exit 126 / 127 — container start failure
+# ---------------------------------------------------------------------------
+
+def test_exit_126_not_executable():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(exit_code=126)])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.HIGH
+    assert "not executable" in f.message or "126" in f.message
+
+
+def test_exit_127_command_not_found():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(exit_code=127)])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.HIGH
+    assert "not found" in f.message or "127" in f.message
+
+
+# ---------------------------------------------------------------------------
+# CannotStartContainerError in container reason
+# ---------------------------------------------------------------------------
+
+def test_cannot_start_container_error():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(reason="CannotStartContainerError: failed to start container")])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# ServiceSchedulerInitiated / UserInitiated stopCodes
+# ---------------------------------------------------------------------------
+
+def test_scheduler_replaced_stop_code():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(stop_code="ServiceSchedulerInitiated", stopped_reason="Scaling activity initiated by deployment")],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.SCHEDULER_REPLACED for f in findings)
+
+
+def test_user_initiated_stop_code():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(stop_code="UserInitiated", stopped_reason="Task stopped by user")],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.USER_INITIATED_STOP for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Exit 132 — SIGILL (wrong CPU architecture)
+# ---------------------------------------------------------------------------
+
+def test_exit_132_sigill():
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[_container(exit_code=132)])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.CONTAINER_START_FAILURE for f in findings)
+    f = next(x for x in findings if x.type == FindingType.CONTAINER_START_FAILURE)
+    assert f.severity == Severity.HIGH
+    assert "132" in f.message or "SIGILL" in f.message or "architecture" in f.message.lower()
+
+
+# ---------------------------------------------------------------------------
+# dependsOn — container with no exit code, no reason, not essential
+# ---------------------------------------------------------------------------
+
+def test_dependency_failed_no_exit_not_essential():
+    container = {"name": "sidecar", "reason": "", "essential": False}
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(containers=[container])],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.DEPENDENCY_FAILED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.DEPENDENCY_FAILED)
+    assert f.severity == Severity.LOW
+
+
+def test_essential_container_no_exit_not_dependency_failed():
+    container = {"name": "app", "reason": "", "essential": True}
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(
+            stopped_reason="Essential container in task exited",
+            containers=[container],
+        )],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert not any(f.type == FindingType.DEPENDENCY_FAILED for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# dependsOn — essential container stopped with "dependent container" reason
+# ---------------------------------------------------------------------------
+
+def test_dependency_failed_essential_with_reason():
+    container = {
+        "name": "app",
+        "reason": "Dependent container failed health check conditions",
+        "essential": True,
+    }
+    ecs = _make_client(
+        [_TASK_ARN],
+        [_task(
+            stopped_reason="Dependent container failed health check conditions",
+            containers=[container],
+        )],
+    )
+    findings, _ = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert any(f.type == FindingType.DEPENDENCY_FAILED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.DEPENDENCY_FAILED)
+    assert f.severity == Severity.MEDIUM
+    assert "dependsOn" in f.message or "HEALTHY" in f.message

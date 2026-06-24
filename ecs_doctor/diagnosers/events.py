@@ -6,7 +6,11 @@ from ecs_doctor.models import Finding, FindingType, Severity
 
 _EVENT_RULES: list[tuple[re.Pattern, FindingType, Severity, str]] = [
     (
-        re.compile(r"unable to place a? ?task|Insufficient \w+", re.IGNORECASE),
+        re.compile(
+            r"unable to place a? ?task|Insufficient \w+|"
+            r"no container instance met all of its requirements",
+            re.IGNORECASE,
+        ),
         FindingType.PLACEMENT_FAILURE,
         Severity.HIGH,
         "Placement failure",
@@ -22,7 +26,11 @@ _EVENT_RULES: list[tuple[re.Pattern, FindingType, Severity, str]] = [
         "Health check failure",
     ),
     (
-        re.compile(r"due to failed deployment checks|rolling back", re.IGNORECASE),
+        re.compile(
+            r"due to failed deployment checks|rolling back|"
+            r"circuit breaker has been (tripped|enabled|triggered)",
+            re.IGNORECASE,
+        ),
         FindingType.DEPLOYMENT_ROLLBACK,
         Severity.CRITICAL,
         "Deployment rollback triggered",
@@ -32,6 +40,31 @@ _EVENT_RULES: list[tuple[re.Pattern, FindingType, Severity, str]] = [
 _STARTED_RE = re.compile(r"started \d+ task", re.IGNORECASE)
 _STOPPED_RE = re.compile(r"stopped \d+ task", re.IGNORECASE)
 _THRASH_THRESHOLD = 3
+
+
+def _check_steady_state_deficit(svc: dict) -> Finding | None:
+    """Detect when service is ACTIVE but has zero running tasks despite a non-zero desired count.
+
+    This means ECS gave up trying to launch tasks — distinct from an in-progress deployment.
+    """
+    status = svc.get("status", "")
+    desired = svc.get("desiredCount", 0)
+    running = svc.get("runningCount", 0)
+    pending = svc.get("pendingCount", 0)
+
+    if status == "ACTIVE" and desired > 0 and running == 0 and pending == 0:
+        return Finding(
+            type=FindingType.TASK_THRASHING,
+            message=(
+                f"Service is ACTIVE but runningCount=0 and pendingCount=0 (desired={desired}). "
+                "ECS stopped trying to launch tasks. Check stop_reasons and CloudWatch logs "
+                "for the failure that caused repeated task exits."
+            ),
+            severity=Severity.CRITICAL,
+            raw_data={"desiredCount": desired, "runningCount": running, "pendingCount": pending},
+            source="events",
+        )
+    return None
 
 
 def _check_deployment_deadlock(svc: dict) -> Finding | None:
@@ -64,6 +97,24 @@ def _check_deployment_deadlock(svc: dict) -> Finding | None:
     return None
 
 
+def _check_deployment_stall(deployments: list[dict]) -> Finding | None:
+    """Detect IN_PROGRESS deployment where tasks launch but never become healthy."""
+    for d in deployments:
+        if d.get("status") == "IN_PROGRESS" and d.get("pendingCount", 0) > 0 and d.get("runningCount", 0) == 0:
+            return Finding(
+                type=FindingType.DEPLOYMENT_STALL,
+                message=(
+                    f"Deployment {d.get('id', '')} is IN_PROGRESS with "
+                    f"pendingCount={d.get('pendingCount')}, runningCount=0. "
+                    "Tasks are launching but failing health checks before reaching steady state."
+                ),
+                severity=Severity.HIGH,
+                raw_data={"deployment_id": d.get("id"), "pendingCount": d.get("pendingCount")},
+                source="events",
+            )
+    return None
+
+
 def diagnose_events(
     service_cache: ServiceDataCache,
     cluster: str,
@@ -91,9 +142,14 @@ def diagnose_events(
 
     findings: list[Finding] = []
 
-    deadlock = _check_deployment_deadlock(svc)
-    if deadlock:
-        findings.append(deadlock)
+    deployments = svc.get("deployments", [])
+    for check in (
+        _check_steady_state_deficit(svc),
+        _check_deployment_deadlock(svc),
+        _check_deployment_stall(deployments),
+    ):
+        if check:
+            findings.append(check)
 
     events: list[dict] = svc.get("events", [])
     seen: set[FindingType] = set()

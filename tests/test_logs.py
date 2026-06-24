@@ -48,6 +48,8 @@ def _td_resp(log_driver: str = "awslogs", container_name: str = _CONTAINER) -> d
         }
     elif log_driver == "splunk":
         log_config = {"logDriver": "splunk", "options": {}}
+    elif log_driver == "awsfirelens":
+        log_config = {"logDriver": "awsfirelens", "options": {}}
 
     return {
         "taskDefinition": {
@@ -221,14 +223,16 @@ def test_missing_log_stream_is_skipped():
 # No awslogs driver — skip gracefully
 # ---------------------------------------------------------------------------
 
-def test_no_awslogs_driver_returns_empty():
+def test_no_awslogs_driver_emits_advisory():
     ecs = make_ecs_client(
         describe_services=_svc_resp(),
         describe_task_definition=_td_resp(log_driver="splunk"),
     )
     logs = make_logs_client(get_log_events=_log_events(["some log line"]))
     findings = _call(ecs, logs)
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0].type == FindingType.MISSING_LOG_CONFIG
+    assert findings[0].severity == Severity.MEDIUM
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +261,77 @@ def test_access_denied_on_get_log_events():
 
 
 # ---------------------------------------------------------------------------
+# Port conflict (new PORT_CONFLICT FindingType)
+# ---------------------------------------------------------------------------
+
+def test_port_already_in_use_detected():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["listen tcp :8080: bind: address already in use"])
+    )
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.PORT_CONFLICT for f in findings)
+    f = next(x for x in findings if x.type == FindingType.PORT_CONFLICT)
+    assert f.severity == Severity.CRITICAL
+
+
+def test_eaddrinuse_detected():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["Error: listen EADDRINUSE: address already in use :::3000"])
+    )
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.PORT_CONFLICT for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# FireLens driver warning
+# ---------------------------------------------------------------------------
+
+def test_firelens_driver_produces_advisory_finding():
+    ecs = make_ecs_client(
+        describe_services=_svc_resp(),
+        describe_task_definition=_td_resp(log_driver="awsfirelens"),
+    )
+    logs = make_logs_client()
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.FIRELENS_LOG_DRIVER for f in findings)
+    f = next(x for x in findings if x.type == FindingType.FIRELENS_LOG_DRIVER)
+    assert f.severity == Severity.LOW
+
+
+# ---------------------------------------------------------------------------
+# JVM OOM: Java heap space → OOM_KILLED finding
+# ---------------------------------------------------------------------------
+
+def test_jvm_heap_oom_detected():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events([
+            "Exception in thread 'main'",
+            "java.lang.OutOfMemoryError: Java heap space",
+        ])
+    )
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.OOM_KILLED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.OOM_KILLED)
+    assert f.severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# AWS SDK throttling detected in logs
+# ---------------------------------------------------------------------------
+
+def test_throttling_exception_detected():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["ThrottlingException: Rate exceeded for operation PutItem"])
+    )
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.LOG_CRASH_SIGNATURE for f in findings)
+
+
+# ---------------------------------------------------------------------------
 # Log context snippet included in raw_data
 # ---------------------------------------------------------------------------
 
@@ -274,3 +349,61 @@ def test_log_context_included_in_raw_data():
     f = next(x for x in findings if x.type == FindingType.LOG_CRASH_SIGNATURE)
     assert "context" in f.raw_data
     assert "Traceback" in f.raw_data["context"]
+
+
+# ---------------------------------------------------------------------------
+# New CRASH_PATTERNS (v0.4.2)
+# ---------------------------------------------------------------------------
+
+def test_econnrefused_pattern():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["connect ECONNREFUSED 127.0.0.1:5432"]))
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.LOG_CRASH_SIGNATURE for f in findings)
+
+
+def test_signal_killed_pattern():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["signal: killed"]))
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.LOG_CRASH_SIGNATURE for f in findings)
+
+
+def test_connection_reset_pattern():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["read: connection reset by peer"]))
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.LOG_CRASH_SIGNATURE for f in findings)
+
+
+def test_broken_pipe_pattern():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["write tcp: broken pipe"]))
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.LOG_CRASH_SIGNATURE for f in findings)
+
+
+def test_oomkilled_string_pattern():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["container exited with OOMKilled"]))
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.OOM_KILLED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.OOM_KILLED)
+    assert f.severity == Severity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# No log driver advisory
+# ---------------------------------------------------------------------------
+
+def test_no_log_driver_emits_advisory():
+    ecs = make_ecs_client(
+        describe_services=_svc_resp(),
+        describe_task_definition=_td_resp(log_driver="none"),
+    )
+    logs = make_logs_client()
+    findings = _call(ecs, logs)
+    assert any(f.type == FindingType.MISSING_LOG_CONFIG for f in findings)
+    f = next(x for x in findings if x.type == FindingType.MISSING_LOG_CONFIG)
+    assert f.severity == Severity.MEDIUM
+    assert f.source == "logs"
