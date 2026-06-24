@@ -44,13 +44,13 @@ ECS Doctor runs **7 parallel diagnostic checks** across the AWS APIs that matter
 
 | Check | AWS APIs | What it catches |
 |-------|----------|-----------------|
-| **Service events** | `ecs:DescribeServices` | Placement failures, deployment rollbacks, crash loops, deployment config deadlock |
-| **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | OOM (exit 137/139), image pull failure, missing secret, non-zero exit, SIGTERM not handled, Spot interruption |
-| **CloudWatch Logs** | `logs:GetLogEvents` | Python / Java / Go / Node.js / Rust / .NET / PHP / Ruby crashes, DNS failures, TLS errors, wrong CPU architecture, EFS mount failures (25+ patterns) |
-| **ALB health** | `elasticloadbalancing:DescribeTargetHealth` | Unhealthy targets — timeout, connection refused, non-2xx |
-| **Metrics** | `cloudwatch:GetMetricData` | CPU or memory above 85% over the last 3 hours |
-| **Task config** | `ecs:DescribeTaskDefinition` | Invalid Fargate CPU/memory combination |
-| **Network** | `ec2:Describe*` | Security groups blocking egress, no NAT Gateway, ENI not attached |
+| **Service events** | `ecs:DescribeServices` | Placement failures, deployment rollbacks, circuit-breaker trips, crash loops, deployment config deadlock, service stuck with 0 running tasks |
+| **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | OOM (exit 137/139), image pull failure, missing secret, non-zero exit, SIGTERM not handled, Spot interruption, bad entrypoint / command not found (exit 126/127), `CannotStartContainerError`, scheduler replacements, manual stops |
+| **CloudWatch Logs** | `logs:GetLogEvents` | Python / Java / Go / Node.js / Rust / .NET / PHP / Ruby crashes, DNS failures, TLS errors, wrong CPU architecture, EFS mount failures, port-already-in-use, JVM heap / Metaspace OOM, FD exhaustion, DB connection pool exhausted, AWS SDK throttling, FireLens driver advisory (37+ patterns) |
+| **ALB health** | `elasticloadbalancing:DescribeTargetHealth` | Unhealthy targets — timeout, connection refused, non-2xx, empty target group (no registered tasks), draining targets, `Target.InvalidState` protocol mismatch |
+| **Metrics** | `cloudwatch:GetMetricData` | Memory ≥ 85% → CRITICAL (OOM imminent), CPU ≥ 85% → HIGH (throttling risk), over the last 3 hours |
+| **Task config** | `ecs:DescribeTaskDefinition` | Invalid Fargate CPU/memory combination, missing `executionRoleArn`, `healthCheck` defined without `healthCheckGracePeriodSeconds`, load balancer port not exposed in `portMappings` |
+| **Network** | `ec2:Describe*` | Security groups blocking egress, no NAT Gateway (suppressed when VPC endpoints for ECR/S3 are present), NACL deny rules on outbound port 443 |
 
 All findings are scored, ranked by confidence, and collapsed into a single root cause.
 
@@ -192,7 +192,8 @@ Minimum policy for a full scan:
       "Action": [
         "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets",
         "ec2:DescribeRouteTables", "ec2:DescribeNatGateways",
-        "ec2:DescribeNetworkInterfaces"
+        "ec2:DescribeNetworkInterfaces", "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeNetworkAcls"
       ],
       "Resource": "*"
     },
