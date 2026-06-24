@@ -245,4 +245,4 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-*Built by [Praveen Rajkoilraj](https://github.com/PraveenLuke). If ECS Doctor saved you time during an incident, consider giving the repo a ⭐.*
+*Built by [@PraveenLuke](https://github.com/PraveenLuke) (Praveen Rajkoilraj). If ECS Doctor saved you time during an incident, consider giving the repo a ⭐.*
