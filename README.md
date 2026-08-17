@@ -28,8 +28,8 @@ ECS Doctor runs **7 parallel diagnostic checks** across the AWS APIs that matter
 | **Service events** | `ecs:DescribeServices` | Why your deployment stalled, rolled back, or never reached steady state |
 | **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | Why your container stopped — OOM, bad image, missing secrets, startup failures, and more |
 | **CloudWatch Logs** | `logs:GetLogEvents` | Crash signatures across Python, Java, Go, Node.js, and 5 other runtimes — without you grepping |
-| **ALB health** | `elasticloadbalancing:DescribeTargetHealth` | Why your load balancer is dropping traffic or has no targets to send to |
-| **Metrics** | `cloudwatch:GetMetricData` | Whether CPU or memory pressure is the underlying cause, with severity-weighted thresholds |
+| **ALB health** | `elasticloadbalancing:DescribeTargetHealth`, `elasticloadbalancing:DescribeTargetGroups` | Why your load balancer is dropping traffic — including health-check path mismatches |
+| **Metrics** | `cloudwatch:GetMetricData` | CPU, memory, ALB 5xx, and unhealthy host count |
 | **Task config** | `ecs:DescribeTaskDefinition` | Misconfiguration in your task definition or service that will silently break deployments |
 | **Network** | `ec2:Describe*` | Connectivity issues blocking your tasks from reaching AWS services or the internet |
 
@@ -82,6 +82,9 @@ ecs-doctor diagnose --cluster my-cluster --service my-service --stream-logs
 # Skip CloudWatch metrics (faster, fewer IAM permissions needed)
 ecs-doctor diagnose --cluster my-cluster --service my-service --no-metrics
 
+# Deep probes: ECR image / Secrets Manager existence + FilterLogEvents (slower)
+ecs-doctor diagnose --cluster my-cluster --service my-service --deep
+
 # Interactive wizard — guides you through account → region → cluster → service
 ecs-doctor browse
 ```
@@ -99,6 +102,7 @@ ecs-doctor diagnose [OPTIONS]
   --stream-logs       Stream live logs from running tasks
   --no-metrics        Skip CloudWatch metrics
   --no-config         Skip task definition config panel
+  --deep              Probe ECR/Secrets/SSM existence after pull/init failures
 ```
 
 ---
@@ -155,17 +159,17 @@ Minimum policy for a full scan:
     },
     {
       "Effect": "Allow",
-      "Action": ["logs:GetLogEvents", "logs:FilterLogEvents", "logs:DescribeLogStreams"],
+      "Action": ["logs:GetLogEvents", "logs:FilterLogEvents"],
       "Resource": "arn:aws:logs:*:*:log-group:/ecs/*:*"
     },
     {
       "Effect": "Allow",
-      "Action": ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics"],
+      "Action": ["cloudwatch:GetMetricData"],
       "Resource": "*"
     },
     {
       "Effect": "Allow",
-      "Action": ["elasticloadbalancing:DescribeTargetHealth"],
+      "Action": ["elasticloadbalancing:DescribeTargetHealth", "elasticloadbalancing:DescribeTargetGroups"],
       "Resource": "*"
     },
     {
@@ -180,6 +184,20 @@ Minimum policy for a full scan:
     },
     { "Effect": "Allow", "Action": ["sts:GetCallerIdentity"], "Resource": "*" }
   ]
+}
+```
+
+`--deep` also needs:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "ecr:DescribeImages",
+    "secretsmanager:DescribeSecret",
+    "ssm:GetParameter"
+  ],
+  "Resource": "*"
 }
 ```
 

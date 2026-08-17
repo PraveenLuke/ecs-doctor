@@ -61,7 +61,7 @@ def _poll_stream(
     kwargs: dict = {
         "logGroupName": log_group,
         "logStreamName": stream_name,
-        "startFromHead": next_token is None,
+        "startFromHead": False,
         "limit": _MAX_LOG_LINES_PER_POLL,
     }
     if next_token:

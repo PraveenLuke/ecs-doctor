@@ -236,6 +236,13 @@ def cli() -> None:
     "--no-config", "skip_config", is_flag=True, default=False,
     help="Skip task definition config display.",
 )
+@click.option(
+    "--deep", is_flag=True, default=False,
+    help=(
+        "When pull or secret-init failed, probe ECR and Secrets Manager / SSM "
+        "for existence, and scan log groups with FilterLogEvents."
+    ),
+)
 def diagnose(
     cluster: str,
     service: str | None,
@@ -245,6 +252,7 @@ def diagnose(
     stream_logs: bool,
     skip_metrics: bool,
     skip_config: bool,
+    deep: bool,
 ) -> None:
     """Run all diagnostic checks on an ECS service and report the most likely root cause."""
     if stream_logs and output_json:
@@ -277,6 +285,12 @@ def diagnose(
             region=effective_region,
             account_id=account_id,
         )
+        ecr_client = secrets_client = ssm_client = None
+        if deep:
+            extra = boto3.Session(region_name=effective_region, profile_name=profile)
+            ecr_client = extra.client("ecr", region_name=effective_region)
+            secrets_client = extra.client("secretsmanager", region_name=effective_region)
+            ssm_client = extra.client("ssm", region_name=effective_region)
         result = run_diagnosis(
             ecs_client=ecs_client,
             logs_client=logs_client,
@@ -286,6 +300,10 @@ def diagnose(
             ec2_client=_ec2_client,
             include_metrics=not skip_metrics,
             include_config=not skip_config,
+            deep=deep,
+            ecr_client=ecr_client,
+            secrets_client=secrets_client,
+            ssm_client=ssm_client,
         )
     except NoCredentialsError:
         _no_creds_error(output_json)
@@ -351,7 +369,7 @@ def browse() -> None:
 
 
 @cli.command()
-@click.option("--host", default="0.0.0.0", show_default=True, help="Bind host.")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind host.")
 @click.option("--port", default=8080, show_default=True, help="Bind port.")
 @click.option("--reload", is_flag=True, default=False, help="Auto-reload on code changes (dev only).")
 def serve(host: str, port: int, reload: bool) -> None:

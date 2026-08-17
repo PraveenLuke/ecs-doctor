@@ -71,7 +71,7 @@ def _make_ecs(log_driver: str = "awslogs") -> object:
     )
 
 
-def _call(ecs, logs, task_arns=None):
+def _call(ecs, logs, task_arns=None, deep=False):
     """Convenience wrapper for the new diagnose_logs(service_cache, ecs_client, ...) signature."""
     if task_arns is None:
         task_arns = [_TASK_ARN]
@@ -84,6 +84,7 @@ def _call(ecs, logs, task_arns=None):
         task_arns,
         REGION,
         ACCOUNT,
+        deep=deep,
     )
 
 
@@ -250,6 +251,16 @@ def test_empty_task_arns_returns_empty():
 # AccessDenied on get_log_events
 # ---------------------------------------------------------------------------
 
+def test_get_log_events_reads_from_stream_tail():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["Traceback (most recent call last):"]))
+    _call(ecs, logs)
+    logs.get_log_events.assert_called()
+    kwargs = logs.get_log_events.call_args.kwargs
+    assert kwargs["startFromHead"] is False
+    assert kwargs["limit"] == 200
+
+
 def test_access_denied_on_get_log_events():
     ecs = _make_ecs()
     logs_client = make_logs_client()
@@ -395,6 +406,77 @@ def test_oomkilled_string_pattern():
 # ---------------------------------------------------------------------------
 # No log driver advisory
 # ---------------------------------------------------------------------------
+
+def test_generic_error_prefix_is_low_severity():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["Error: custom application warning without a crash"])
+    )
+    findings = _call(ecs, logs)
+    generic = [f for f in findings if f.raw_data.get("label") == "Node.js/generic error"]
+    assert generic
+    assert generic[0].severity == Severity.LOW
+    assert generic[0].type == FindingType.LOG_CRASH_SIGNATURE
+
+
+def test_deep_false_does_not_call_filter_log_events():
+    ecs = _make_ecs()
+    logs = make_logs_client(get_log_events=_log_events(["ok"]))
+    _call(ecs, logs, deep=False)
+    logs.filter_log_events.assert_not_called()
+
+
+def test_deep_filter_log_events_finds_crash_outside_known_streams():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["healthy"]),
+        filter_log_events={
+            "events": [{"message": "panic: boom", "logStreamName": "ecs/app/other-task"}]
+        },
+    )
+    findings = _call(ecs, logs, deep=True)
+    assert any(
+        f.type == FindingType.LOG_CRASH_SIGNATURE and "Go panic" in f.message
+        for f in findings
+    )
+    logs.filter_log_events.assert_called()
+    kwargs = logs.filter_log_events.call_args.kwargs
+    assert kwargs["logGroupName"] == _LOG_GROUP
+    assert "filterPattern" in kwargs
+
+
+def test_deep_filter_log_events_access_denied_is_iam_finding():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["ok"]),
+        filter_log_events=access_denied_error("FilterLogEvents"),
+    )
+    findings = _call(ecs, logs, deep=True)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    assert any("logs:FilterLogEvents" in f.message for f in findings)
+
+
+def test_deep_filter_log_events_groups_by_stream():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["healthy"]),
+        filter_log_events={
+            "events": [
+                {"message": "panic: boom", "logStreamName": "ecs/app/task-a"},
+                {"message": "Traceback (most recent call last)", "logStreamName": "ecs/app/task-b"},
+            ]
+        },
+    )
+    findings = _call(ecs, logs, deep=True)
+    panic = [f for f in findings if "Go panic" in f.message]
+    traceback = [f for f in findings if "Python traceback" in f.message]
+    assert panic
+    assert traceback
+    assert panic[0].raw_data["task_id"] == "task-a"
+    assert traceback[0].raw_data["task_id"] == "task-b"
+    assert panic[0].raw_data["log_stream"] == "ecs/app/task-a"
+    assert traceback[0].raw_data["log_stream"] == "ecs/app/task-b"
+
 
 def test_no_log_driver_emits_advisory():
     ecs = make_ecs_client(

@@ -372,3 +372,66 @@ def test_public_ip_enabled_in_public_subnet_no_finding():
     )
     findings = _call(ecs, ec2)
     assert not any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)
+
+
+def test_vpc_endpoints_access_denied_returns_iam_finding():
+    ecs = make_ecs_client(describe_services=_svc())
+    ec2 = make_ecs_client(
+        describe_route_tables={
+            "RouteTables": [
+                {
+                    "Routes": [{"GatewayId": "local", "DestinationCidrBlock": "10.0.0.0/16"}],
+                    "VpcId": "vpc-abc123",
+                }
+            ]
+        },
+        describe_vpc_endpoints=access_denied_error("DescribeVpcEndpoints"),
+        describe_security_groups=_security_groups(has_egress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.IAM_DENIED)
+    assert "ec2:DescribeVpcEndpoints" in f.message
+    assert not any(f.type == FindingType.NETWORK_CONNECTIVITY for f in findings)
+
+
+def test_list_tasks_access_denied_without_awsvpc_returns_iam_finding():
+    ecs = make_ecs_client(
+        describe_services={"services": [{"networkConfiguration": {}, "loadBalancers": []}]},
+    )
+    ecs.list_tasks.side_effect = access_denied_error("ListTasks")
+    ec2 = make_ecs_client()
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.IAM_DENIED)
+    assert "ecs:ListTasks" in f.message
+
+
+def test_describe_tasks_access_denied_without_awsvpc_returns_iam_finding():
+    ecs = make_ecs_client(
+        describe_services={"services": [{"networkConfiguration": {}, "loadBalancers": []}]},
+        list_tasks={"taskArns": [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/abc"]},
+        describe_tasks=access_denied_error("DescribeTasks"),
+    )
+    ec2 = make_ecs_client()
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.IAM_DENIED)
+    assert "ecs:DescribeTasks" in f.message
+
+
+def test_public_ip_check_access_denied_returns_iam_finding():
+    ecs = make_ecs_client(describe_services=_svc_with_lb(assign_public_ip="DISABLED"))
+    ec2 = make_ecs_client(
+        describe_route_tables=_route_tables(has_nat=True),
+        describe_security_groups=_sg_with_ingress(has_ingress=True),
+        describe_network_acls={"NetworkAcls": []},
+    )
+    # First route-table call (egress) succeeds; later public-IP call is denied.
+    ec2.describe_route_tables.side_effect = [
+        _route_tables(has_nat=True),
+        access_denied_error("DescribeRouteTables"),
+    ]
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)

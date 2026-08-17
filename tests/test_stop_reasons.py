@@ -16,11 +16,16 @@ from tests.conftest import (
 _TASK_ARN = f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/abc123"
 
 
-def _make_client(task_arns: list[str], tasks: list[dict]) -> object:
-    return make_ecs_client(
-        list_tasks={"taskArns": task_arns},
-        describe_tasks={"tasks": tasks},
-    )
+def _make_client(task_arns: list[str], tasks: list[dict], running_arns: list[str] | None = None) -> object:
+    client = make_ecs_client(describe_tasks={"tasks": tasks})
+
+    def _list_tasks(**kwargs):
+        if kwargs.get("desiredStatus") == "RUNNING":
+            return {"taskArns": running_arns or []}
+        return {"taskArns": task_arns}
+
+    client.list_tasks.side_effect = _list_tasks
+    return client
 
 
 def _task(
@@ -239,7 +244,26 @@ def test_access_denied_on_describe_tasks():
     assert any(f.type == FindingType.IAM_DENIED for f in findings)
     assert "ecs:DescribeTasks" in findings[0].message
     # task_arns still returned so logs can try
-    assert arns == [_TASK_ARN]
+    assert _TASK_ARN in arns
+
+
+def test_describe_tasks_access_denied_caps_stopped_arns_for_logs():
+    stopped = [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/stopped{i}" for i in range(30)]
+    running = [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/running"]
+    ecs = make_ecs_client(describe_tasks=access_denied_error("DescribeTasks"))
+
+    def _list_tasks(**kwargs):
+        if kwargs.get("desiredStatus") == "RUNNING":
+            return {"taskArns": running}
+        return {"taskArns": stopped}
+
+    ecs.list_tasks.side_effect = _list_tasks
+    findings, arns = diagnose_stop_reasons(
+        ecs, CLUSTER, SERVICE, REGION, ACCOUNT, max_classify=5,
+    )
+    assert findings[0].type == FindingType.IAM_DENIED
+    assert running[0] in arns
+    assert [a for a in arns if a in stopped] == stopped[:5]
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +411,59 @@ def test_dependency_failed_essential_with_reason():
     f = next(x for x in findings if x.type == FindingType.DEPENDENCY_FAILED)
     assert f.severity == Severity.MEDIUM
     assert "dependsOn" in f.message or "HEALTHY" in f.message
+
+
+def test_log_arns_include_running_tasks():
+    running_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/running1"
+    stopped_arn = f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/stopped1"
+    ecs = make_ecs_client(describe_tasks={"tasks": [
+        _task(task_arn=stopped_arn, containers=[_container(exit_code=137)]),
+    ]})
+
+    def _list_tasks(**kwargs):
+        if kwargs.get("desiredStatus") == "RUNNING":
+            return {"taskArns": [running_arn]}
+        return {"taskArns": [stopped_arn]}
+
+    ecs.list_tasks.side_effect = _list_tasks
+    findings, arns = diagnose_stop_reasons(ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert running_arn in arns
+    assert stopped_arn in arns
+    assert any(f.type == FindingType.OOM_KILLED for f in findings)
+    assert all(running_arn not in f.raw_data.get("affected_tasks", []) for f in findings)
+
+
+def test_classifies_most_recently_stopped_tasks():
+    older = [
+        _task(
+            task_arn=f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/old{i}",
+            stopped_reason="Essential container in task exited",
+            containers=[_container(exit_code=1)],
+        )
+        for i in range(5)
+    ]
+    for i, t in enumerate(older):
+        t["stoppedAt"] = f"2026-01-01T00:00:0{i}Z"
+    newest = _task(
+        task_arn=f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/new",
+        stopped_reason="Essential container in task exited",
+        containers=[_container(exit_code=137)],
+    )
+    newest["stoppedAt"] = "2026-08-17T12:00:00Z"
+    all_tasks = [*older, newest]
+    all_arns = [t["taskArn"] for t in all_tasks]
+    ecs = make_ecs_client(describe_tasks={"tasks": all_tasks})
+
+    def _list_tasks(**kwargs):
+        if kwargs.get("desiredStatus") == "RUNNING":
+            return {"taskArns": []}
+        return {"taskArns": all_arns}
+
+    ecs.list_tasks.side_effect = _list_tasks
+    findings, _ = diagnose_stop_reasons(
+        ecs, CLUSTER, SERVICE, REGION, ACCOUNT, max_classify=3,
+    )
+    oom = next(f for f in findings if f.type == FindingType.OOM_KILLED)
+    assert newest["taskArn"] in oom.raw_data["affected_tasks"]
+    classified = {arn for f in findings for arn in f.raw_data.get("affected_tasks", [])}
+    assert len(classified) <= 3

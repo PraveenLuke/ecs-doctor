@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from ecs_doctor._html import html_select_options
 from ecs_doctor.engine import DiagnosisRequest, run_diagnosis, to_json_safe
 
 router = APIRouter()
@@ -52,9 +53,7 @@ async def clusters_options(region: str = "us-east-1", profile: str | None = None
         clusters = []
     if not clusters:
         return HTMLResponse('<option value="" disabled selected>No clusters found</option>')
-    options = '<option value="" disabled selected>— Select a cluster —</option>\n'
-    options += "\n".join(f'<option value="{c}">{c}</option>' for c in clusters)
-    return HTMLResponse(options)
+    return HTMLResponse(html_select_options(clusters, "— Select a cluster —"))
 
 
 @router.get("/api/services-options", response_class=HTMLResponse)
@@ -69,9 +68,7 @@ async def services_options(cluster: str = "", region: str = "us-east-1", profile
         services = []
     if not services:
         return HTMLResponse('<option value="" disabled selected>No services found</option>')
-    options = '<option value="" disabled selected>— Select a service —</option>\n'
-    options += "\n".join(f'<option value="{s}">{s}</option>' for s in services)
-    return HTMLResponse(options)
+    return HTMLResponse(html_select_options(services, "— Select a service —"))
 
 
 @router.post("/diagnose", response_class=HTMLResponse, responses=_RESPONSES_401_500)

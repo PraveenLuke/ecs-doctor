@@ -95,6 +95,13 @@ def test_iam_denied():
     assert "iam" in result.cause.lower() or "permission" in result.cause.lower()
 
 
+def test_service_not_found():
+    result = aggregate([_f(FindingType.SERVICE_NOT_FOUND, Severity.HIGH)])
+    assert "not found" in result.cause.lower() or "service" in result.cause.lower()
+    assert result.confidence > 0.5
+    assert result.suggested_fix != ""
+
+
 # ---------------------------------------------------------------------------
 # Scoring and confidence
 # ---------------------------------------------------------------------------
@@ -164,6 +171,34 @@ def test_unmapped_finding_type_uses_fallback_weight():
     assert result.cause != ""
     assert result.confidence >= 0.0
     assert result.suggested_fix != ""
+
+
+def test_oom_and_high_memory_fuse_above_noisy_log_crashes():
+    findings = [
+        _f(FindingType.OOM_KILLED, Severity.HIGH),
+        _f(FindingType.HIGH_MEMORY_UTILIZATION, Severity.HIGH),
+        _f(FindingType.LOG_CRASH_SIGNATURE, Severity.HIGH),
+        _f(FindingType.LOG_CRASH_SIGNATURE, Severity.HIGH),
+        _f(FindingType.LOG_CRASH_SIGNATURE, Severity.HIGH),
+    ]
+    result = aggregate(findings)
+    assert "memory" in result.cause.lower() or "OOM" in result.cause
+
+
+def test_image_not_found_beats_generic_pull_failure():
+    result = aggregate([
+        _f(FindingType.IMAGE_PULL_FAILURE, Severity.CRITICAL),
+        _f(FindingType.IMAGE_NOT_FOUND, Severity.CRITICAL),
+    ])
+    assert "not found" in result.cause.lower() or "does not exist" in result.cause.lower()
+
+
+def test_secret_not_found_beats_generic_init_failure():
+    result = aggregate([
+        _f(FindingType.SECRETS_INIT_FAILURE, Severity.CRITICAL),
+        _f(FindingType.SECRET_NOT_FOUND, Severity.CRITICAL),
+    ])
+    assert "not found" in result.cause.lower() or "does not exist" in result.cause.lower()
 
 
 def test_new_finding_types_produce_non_zero_confidence():

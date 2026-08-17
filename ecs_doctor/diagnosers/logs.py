@@ -1,5 +1,8 @@
 
 import re
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -10,6 +13,10 @@ from ecs_doctor.models import Finding, FindingType, Severity
 _AWSLOGS_DRIVER = "awslogs"
 _FIRELENS_DRIVER = "awsfirelens"
 _MAX_LOG_LINES = 200
+_MAX_FILTER_EVENTS = 50
+_FILTER_LOOKBACK = timedelta(hours=1)
+_FILTER_PATTERN = "?ERROR ?Error ?panic ?Traceback ?FATAL ?OOMKilled ?Exception"
+_LOG_SCAN_WORKERS = 8
 
 # (regex pattern, human label, severity, finding_type)
 CRASH_PATTERNS: list[tuple[str, str, Severity, FindingType]] = [
@@ -22,7 +29,7 @@ CRASH_PATTERNS: list[tuple[str, str, Severity, FindingType]] = [
     (r"System\.Exception:|Unhandled exception\.", ".NET exception",        Severity.HIGH,     FindingType.LOG_CRASH_SIGNATURE),
     (r"PHP Fatal error:",                    "PHP fatal error",            Severity.HIGH,     FindingType.LOG_CRASH_SIGNATURE),
     (r"RuntimeError",                        "Ruby/generic runtime error", Severity.HIGH,     FindingType.LOG_CRASH_SIGNATURE),
-    (r"Error: ",                             "Node.js/generic error",      Severity.MEDIUM,   FindingType.LOG_CRASH_SIGNATURE),
+    (r"Error: ",                             "Node.js/generic error",      Severity.LOW,      FindingType.LOG_CRASH_SIGNATURE),
     # Permissions and connectivity
     (r"permission denied",                   "Permission denied",          Severity.MEDIUM,   FindingType.LOG_CRASH_SIGNATURE),
     (r"exec: .* permission denied",          "Entrypoint not executable",  Severity.HIGH,     FindingType.LOG_CRASH_SIGNATURE),
@@ -128,38 +135,15 @@ def _awslogs_configs(container_defs: list[dict], region: str) -> dict[str, dict[
     return configs
 
 
-def _scan_log_stream(
-    logs_client,
-    log_group: str,
-    stream_name: str,
-    log_region: str,
-    account_id: str,
+def _scan_lines(
+    log_lines: list[str],
     container_name: str,
     task_id: str,
+    log_group: str,
+    stream_name: str,
 ) -> list[Finding]:
-    try:
-        log_resp = logs_client.get_log_events(
-            logGroupName=log_group,
-            logStreamName=stream_name,
-            startFromHead=True,
-            limit=_MAX_LOG_LINES,
-        )
-    except ClientError as exc:
-        if is_access_denied(exc):
-            return [iam_finding(
-                "logs:GetLogEvents",
-                f"arn:aws:logs:{log_region}:{account_id}:log-group:{log_group}:*",
-                "logs",
-            )]
-        if exc.response["Error"]["Code"] == "ResourceNotFoundException":
-            return []
-        raise
-
-    events: list[dict[str, Any]] = log_resp.get("events", [])
-    if not events:
+    if not log_lines:
         return []
-
-    log_lines = [e["message"] for e in events]
     log_text = "\n".join(log_lines)
     findings: list[Finding] = []
     seen_labels: set[str] = set()
@@ -189,29 +173,116 @@ def _scan_log_stream(
     return findings
 
 
+def _scan_log_stream(
+    logs_client,
+    log_group: str,
+    stream_name: str,
+    log_region: str,
+    account_id: str,
+    container_name: str,
+    task_id: str,
+) -> list[Finding]:
+    try:
+        log_resp = logs_client.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream_name,
+            startFromHead=False,
+            limit=_MAX_LOG_LINES,
+        )
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [iam_finding(
+                "logs:GetLogEvents",
+                f"arn:aws:logs:{log_region}:{account_id}:log-group:{log_group}:*",
+                "logs",
+            )]
+        if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+            return []
+        raise
+
+    events: list[dict[str, Any]] = log_resp.get("events", [])
+    log_lines = [e["message"] for e in events]
+    return _scan_lines(log_lines, container_name, task_id, log_group, stream_name)
+
+
 def _scan_all_tasks(
     logs_client,
     task_arns: list[str],
     log_configs: dict,
     account_id: str,
 ) -> list[Finding]:
-    findings: list[Finding] = []
+    jobs: list[tuple] = []
     for task_arn in task_arns:
         task_id = task_arn.split("/")[-1]
         for container_name, cfg in log_configs.items():
             stream_name = f"{cfg['stream_prefix']}/{container_name}/{task_id}"
-            stream_findings = _scan_log_stream(
+            jobs.append((cfg, container_name, stream_name, task_id))
+
+    if not jobs:
+        return []
+
+    findings: list[Finding] = []
+    workers = min(_LOG_SCAN_WORKERS, len(jobs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _scan_log_stream,
                 logs_client,
-                log_group=cfg["log_group"],
-                stream_name=stream_name,
-                log_region=cfg["log_region"],
-                account_id=account_id,
-                container_name=container_name,
-                task_id=task_id,
+                job[0]["log_group"],
+                job[2],
+                job[0]["log_region"],
+                account_id,
+                job[1],
+                job[3],
             )
-            findings.extend(stream_findings)
-            if any(f.type == FindingType.IAM_DENIED for f in stream_findings):
-                break
+            for job in jobs
+        ]
+        for future in as_completed(futures):
+            findings.extend(future.result())
+    return findings
+
+
+def _filter_log_groups(
+    logs_client,
+    log_configs: dict,
+    account_id: str,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    start_ms = int((datetime.now(timezone.utc) - _FILTER_LOOKBACK).timestamp() * 1000)
+    seen_groups: set[str] = set()
+    for cfg in log_configs.values():
+        log_group = cfg["log_group"]
+        if log_group in seen_groups:
+            continue
+        seen_groups.add(log_group)
+        try:
+            resp = logs_client.filter_log_events(
+                logGroupName=log_group,
+                filterPattern=_FILTER_PATTERN,
+                startTime=start_ms,
+                limit=_MAX_FILTER_EVENTS,
+            )
+        except ClientError as exc:
+            if is_access_denied(exc):
+                findings.append(iam_finding(
+                    "logs:FilterLogEvents",
+                    f"arn:aws:logs:{cfg['log_region']}:{account_id}:log-group:{log_group}:*",
+                    "logs",
+                ))
+                return findings
+            if exc.response["Error"]["Code"] == "ResourceNotFoundException":
+                continue
+            raise
+        events = resp.get("events", [])
+        if not events:
+            continue
+        by_stream: dict[str, list[str]] = defaultdict(list)
+        for event in events:
+            stream_name = event.get("logStreamName") or ""
+            by_stream[stream_name].append(event.get("message", ""))
+        for stream_name, log_lines in by_stream.items():
+            task_id = stream_name.split("/")[-1] if stream_name else "unknown"
+            findings.extend(_scan_lines(log_lines, "filtered", task_id, log_group, stream_name))
     return findings
 
 
@@ -224,6 +295,7 @@ def diagnose_logs(
     task_arns: list[str],
     region: str,
     account_id: str,
+    deep: bool = False,
 ) -> list[Finding]:
     if not task_arns:
         return []
@@ -245,13 +317,11 @@ def diagnose_logs(
         return []
 
     try:
-        td_resp = ecs_client.describe_task_definition(taskDefinition=task_def_arn)
-    except ClientError as exc:
-        if is_access_denied(exc):
-            return [iam_finding("ecs:DescribeTaskDefinition", task_def_arn, "logs")]
-        raise
+        td = service_cache.get_task_definition(task_def_arn)
+    except _AccessDeniedCached:
+        return [iam_finding("ecs:DescribeTaskDefinition", task_def_arn, "logs")]
 
-    container_defs = td_resp.get("taskDefinition", {}).get("containerDefinitions", [])
+    container_defs = td.get("containerDefinitions", [])
     findings: list[Finding] = _check_firelens(container_defs)
     log_configs = _awslogs_configs(container_defs, region)
     if not log_configs:
@@ -269,4 +339,6 @@ def diagnose_logs(
             ))
         return findings
     findings.extend(_scan_all_tasks(logs_client, task_arns, log_configs, account_id))
+    if deep:
+        findings.extend(_filter_log_groups(logs_client, log_configs, account_id))
     return findings

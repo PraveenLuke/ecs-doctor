@@ -134,7 +134,7 @@ def diagnose_events(
 
     if svc is None:
         return [Finding(
-            type=FindingType.IAM_DENIED,
+            type=FindingType.SERVICE_NOT_FOUND,
             message=f"Service '{service}' not found in cluster '{cluster}'.",
             severity=Severity.HIGH,
             source="events",

@@ -218,6 +218,7 @@ def test_empty_target_group_produces_no_alb_targets_finding():
     f = next(x for x in findings if x.type == FindingType.NO_ALB_TARGETS)
     assert f.severity == Severity.HIGH
     assert f.raw_data["tg_arn"] == _TG_ARN
+    elb.describe_target_groups.assert_called()
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +281,38 @@ def test_unused_no_reason_produces_low_finding():
     f = next(x for x in findings if x.type == FindingType.HEALTH_CHECK_FAIL)
     assert f.severity == Severity.LOW
     assert "unused" in f.message.lower() or "listener" in f.message.lower()
+
+
+def test_unhealthy_root_health_check_path_adds_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("unhealthy", "Target.FailedHealthChecks"),
+        describe_target_groups={
+            "TargetGroups": [{
+                "TargetGroupArn": _TG_ARN,
+                "HealthCheckPath": "/",
+                "HealthCheckIntervalSeconds": 30,
+                "HealthCheckTimeoutSeconds": 5,
+                "Matcher": {"HttpCode": "200"},
+            }]
+        },
+    )
+    findings = _call(ecs, elb)
+    path_findings = [
+        f for f in findings
+        if f.type == FindingType.HEALTH_CHECK_FAIL and "health check path" in f.message.lower()
+    ]
+    assert path_findings
+    assert path_findings[0].severity == Severity.MEDIUM
+
+
+def test_describe_target_groups_access_denied_returns_iam_finding():
+    ecs = make_ecs_client(describe_services=_svc_resp([_lb()]))
+    elb = make_elbv2_client(
+        describe_target_health=_target_health("healthy"),
+        describe_target_groups=access_denied_error("DescribeTargetGroups"),
+    )
+    findings = _call(ecs, elb)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.IAM_DENIED)
+    assert "DescribeTargetGroups" in f.message

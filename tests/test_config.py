@@ -188,7 +188,7 @@ class TestValidateFargateCpuMemory:
 
 class TestDiagnoseConfig:
     def _call(self, ecs):
-        return diagnose_config(make_service_cache(ecs), ecs, CLUSTER, SERVICE, REGION, ACCOUNT)
+        return diagnose_config(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
 
     def test_success_returns_configs(self):
         ecs = make_ecs_client(describe_services=_svc(), describe_task_definition=_td())

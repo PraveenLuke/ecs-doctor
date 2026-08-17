@@ -100,24 +100,30 @@ def _safe_metrics(future) -> tuple[list[Finding], MetricSnapshot | None]:
 def _run_config(
     include_config: bool,
     cache: ServiceDataCache,
-    ecs_client,
     kwargs: dict,
 ) -> tuple[list[Finding], ServiceConfig | None, TaskConfig | None]:
     if not include_config:
         return [], None, None
     from ecs_doctor.diagnosers.config import diagnose_config
-    return diagnose_config(service_cache=cache, ecs_client=ecs_client, **kwargs)
+    return diagnose_config(service_cache=cache, **kwargs)
 
 
 def _run_metrics(
     include_metrics: bool,
     cw_client,
+    cache: ServiceDataCache,
+    elb_client,
     kwargs: dict,
 ) -> tuple[list[Finding], MetricSnapshot | None]:
     if not include_metrics or cw_client is None:
         return [], None
     from ecs_doctor.diagnosers.metrics import diagnose_metrics
-    return diagnose_metrics(cw_client=cw_client, **kwargs)
+    return diagnose_metrics(
+        cw_client=cw_client,
+        service_cache=cache,
+        elbv2_client=elb_client,
+        **kwargs,
+    )
 
 
 def _run_network(
@@ -134,6 +140,28 @@ def _run_network(
     )
 
 
+def _run_deep(
+    deep: bool,
+    findings: list[Finding],
+    cache: ServiceDataCache,
+    ecr_client,
+    secrets_client,
+    ssm_client,
+    kwargs: dict,
+) -> list[Finding]:
+    if not deep:
+        return []
+    from ecs_doctor.diagnosers.deep import diagnose_deep
+    return diagnose_deep(
+        findings=findings,
+        service_cache=cache,
+        ecr_client=ecr_client,
+        secrets_client=secrets_client,
+        ssm_client=ssm_client,
+        **kwargs,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public orchestration entry point
 # ---------------------------------------------------------------------------
@@ -147,12 +175,19 @@ def run_diagnosis(
     ec2_client=None,
     include_metrics: bool = True,
     include_config: bool = True,
+    deep: bool = False,
+    ecr_client=None,
+    secrets_client=None,
+    ssm_client=None,
 ) -> DiagnosisResult:
     """Orchestrate all diagnosers in parallel and return a single DiagnosisResult.
 
-    Phase 1 runs six diagnosers concurrently via ThreadPoolExecutor.
-    Phase 2 runs diagnose_logs sequentially after stop_reasons completes,
-    because logs depends on the task_arns returned by stop_reasons.
+    Phase 1 runs independent diagnosers concurrently via ThreadPoolExecutor.
+    Logs are submitted as soon as stop_reasons returns task ARNs, overlapping
+    remaining Phase 1 work (metrics, network, config).
+
+    --deep probes (ECR image / Secrets / SSM existence) start after stop
+    reasons, still overlapping remaining Phase 1 work.
 
     Called by both cli.py and web routes — zero logic duplicated.
     """
@@ -166,40 +201,47 @@ def run_diagnosis(
         "account_id": request.account_id,
     }
 
-    # Phase 1: parallel execution of all diagnosers that are independent
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         f_events  = pool.submit(diagnose_events, service_cache=cache, **kwargs)
         f_stop    = pool.submit(diagnose_stop_reasons, ecs_client=ecs_client, **kwargs)
         f_alb     = pool.submit(diagnose_alb_health, service_cache=cache, elbv2_client=elb_client, **kwargs)
-        f_config  = pool.submit(_run_config, include_config, cache, ecs_client, kwargs)
-        f_metrics = pool.submit(_run_metrics, include_metrics, cw_client, kwargs)
+        f_config  = pool.submit(_run_config, include_config, cache, kwargs)
+        f_metrics = pool.submit(_run_metrics, include_metrics, cw_client, cache, elb_client, kwargs)
         f_network = pool.submit(_run_network, cache, ecs_client, ec2_client, kwargs)
 
-    # Phase 2: logs needs task_arns from stop_reasons (sequential dependency)
-    stop_findings, task_arns = _safe_stop(f_stop)
-    try:
-        log_findings = diagnose_logs(
+        # Logs only need stop_reasons task ARNs — start them without waiting
+        # for metrics/network/config to finish.
+        stop_findings, task_arns = _safe_stop(f_stop)
+        f_logs = pool.submit(
+            diagnose_logs,
             service_cache=cache,
             ecs_client=ecs_client,
             logs_client=logs_client,
             task_arns=task_arns,
+            deep=deep,
             **kwargs,
         )
-    except Exception as exc:  # noqa: BLE001
-        log_findings = [Finding(
-            type=FindingType.IAM_DENIED,
-            message=f"[logs] Unexpected error: {exc}",
-            severity=Severity.LOW,
-            source="logs",
-        )]
+        f_deep = pool.submit(
+            _run_deep,
+            deep,
+            stop_findings,
+            cache,
+            ecr_client,
+            secrets_client,
+            ssm_client,
+            kwargs,
+        )
+        log_findings = _safe_findings(f_logs, "logs")
+        deep_findings = _safe_findings(f_deep, "deep")
 
-    config_findings, service_config, task_config = _safe_config(f_config)
-    metric_findings, metrics = _safe_metrics(f_metrics)
+        config_findings, service_config, task_config = _safe_config(f_config)
+        metric_findings, metrics = _safe_metrics(f_metrics)
 
     all_findings: list[Finding] = (
         _safe_findings(f_events, "events")
         + stop_findings
         + log_findings
+        + deep_findings
         + _safe_findings(f_alb, "alb_health")
         + config_findings
         + metric_findings

@@ -24,6 +24,8 @@ class FindingType(str, Enum):
     NON_ZERO_EXIT = "non_zero_exit"
     IMAGE_PULL_FAILURE = "image_pull_failure"
     SECRETS_INIT_FAILURE = "secrets_init_failure"
+    IMAGE_NOT_FOUND = "image_not_found"
+    SECRET_NOT_FOUND = "secret_not_found"
     ESSENTIAL_EXITED = "essential_container_exited"
     PREMATURE_EXIT = "premature_exit"
     GRACEFUL_SHUTDOWN_FAIL = "graceful_shutdown_failure"
@@ -44,6 +46,7 @@ class FindingType(str, Enum):
     # metrics.py
     HIGH_CPU_UTILIZATION = "high_cpu_utilization"
     HIGH_MEMORY_UTILIZATION = "high_memory_utilization"
+    ALB_TARGET_5XX = "alb_target_5xx"
     # config.py
     INVALID_TASK_CONFIG = "invalid_task_config"
     MISSING_EXECUTION_ROLE = "missing_execution_role"
@@ -59,6 +62,7 @@ class FindingType(str, Enum):
     CIRCUIT_BREAKER_DISABLED = "circuit_breaker_disabled"
     MISSING_LOG_CONFIG = "missing_log_config"
     # shared
+    SERVICE_NOT_FOUND = "service_not_found"
     IAM_DENIED = "iam_access_denied"
 
 

@@ -1,7 +1,14 @@
 
 from botocore.exceptions import ClientError
 
-from ecs_doctor._aws import ServiceDataCache, _AccessDeniedCached, iam_finding, is_access_denied, service_resource_arn
+from ecs_doctor._aws import (
+    ServiceDataCache,
+    _AccessDeniedCached,
+    cluster_resource_arn,
+    iam_finding,
+    is_access_denied,
+    service_resource_arn,
+)
 from ecs_doctor.models import Finding, FindingType, Severity
 
 _HTTPS_PORT = 443
@@ -29,10 +36,13 @@ def _has_outbound_internet(routes: list[dict]) -> bool:
     return False
 
 
-def _has_vpc_endpoints(ec2_client, vpc_id: str, region: str) -> bool:
+def _has_vpc_endpoints(
+    ec2_client, vpc_id: str, region: str, account_id: str
+) -> bool | Finding:
     """Return True if the VPC has the core endpoints needed for ECR, S3, and secrets.
 
     If present, tasks in private subnets without NAT can still pull images and read secrets.
+    AccessDenied is returned as an IAM finding so it is not mistaken for 'no endpoints'.
     """
     try:
         resp = ec2_client.describe_vpc_endpoints(
@@ -41,7 +51,13 @@ def _has_vpc_endpoints(ec2_client, vpc_id: str, region: str) -> bool:
                 {"Name": "state", "Values": ["available"]},
             ]
         )
-    except ClientError:
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return iam_finding(
+                "ec2:DescribeVpcEndpoints",
+                f"arn:aws:ec2:{region}:{account_id}:vpc-endpoint/*",
+                _SOURCE,
+            )
         return False
 
     endpoint_services: set[str] = {ep.get("ServiceName", "") for ep in resp.get("VpcEndpoints", [])}
@@ -109,8 +125,12 @@ def _check_subnet_egress(ec2_client, subnet_id: str, region: str, account_id: st
         return None
 
     vpc_id = route_tables[0].get("VpcId", "")
-    if vpc_id and _has_vpc_endpoints(ec2_client, vpc_id, region):
-        return None
+    if vpc_id:
+        endpoints = _has_vpc_endpoints(ec2_client, vpc_id, region, account_id)
+        if isinstance(endpoints, Finding):
+            return endpoints
+        if endpoints:
+            return None
 
     return Finding(
         type=FindingType.NETWORK_CONNECTIVITY,
@@ -157,8 +177,10 @@ def _get_task_network_details(
     ecs_client,
     cluster: str,
     service: str,
-) -> tuple[list[str], list[str]]:
-    """Return (subnet_ids, security_group_ids) from a running or stopped task."""
+    region: str,
+    account_id: str,
+) -> tuple[list[str], list[str], Finding | None]:
+    """Return (subnet_ids, security_group_ids, iam_finding) from a running or stopped task."""
     try:
         running = ecs_client.list_tasks(cluster=cluster, serviceName=service, desiredStatus="RUNNING")
         arns = running.get("taskArns", [])
@@ -166,12 +188,27 @@ def _get_task_network_details(
             stopped = ecs_client.list_tasks(cluster=cluster, serviceName=service, desiredStatus="STOPPED", maxResults=1)
             arns = stopped.get("taskArns", [])
         if not arns:
-            return [], []
+            return [], [], None
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [], [], iam_finding(
+                "ecs:ListTasks",
+                cluster_resource_arn(region, account_id, cluster),
+                _SOURCE,
+            )
+        return [], [], None
 
+    try:
         tasks_resp = ecs_client.describe_tasks(cluster=cluster, tasks=arns[:1])
         task = tasks_resp.get("tasks", [{}])[0]
-    except ClientError:
-        return [], []
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [], [], iam_finding(
+                "ecs:DescribeTasks",
+                cluster_resource_arn(region, account_id, cluster),
+                _SOURCE,
+            )
+        return [], [], None
 
     subnet_ids: list[str] = []
     sg_ids: list[str] = []
@@ -187,7 +224,7 @@ def _get_task_network_details(
     subnet_ids = subnet_ids or vpc_config.get("subnets", [])
     sg_ids = vpc_config.get("securityGroups", [])
 
-    return subnet_ids, sg_ids
+    return subnet_ids, sg_ids, None
 
 
 def _rule_allows_port(rule: dict, port: int) -> bool:
@@ -247,6 +284,8 @@ def _check_public_ip_assignment(
     ec2_client,
     svc: dict,
     subnet_ids: list[str],
+    region: str,
+    account_id: str,
 ) -> Finding | None:
     """Return a finding when assignPublicIp=DISABLED but the subnet routes via IGW (no NAT)."""
     network_config = svc.get("networkConfiguration", {}).get("awsvpcConfiguration", {})
@@ -258,7 +297,13 @@ def _check_public_ip_assignment(
         resp = ec2_client.describe_route_tables(
             Filters=[{"Name": _SUBNET_ASSOC_FILTER, "Values": [subnet_ids[0]]}]
         )
-    except ClientError:
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return iam_finding(
+                "ec2:DescribeRouteTables",
+                f"arn:aws:ec2:{region}:{account_id}:route-table/*",
+                _SOURCE,
+            )
         return None
 
     for rt in resp.get("RouteTables", []):
@@ -315,7 +360,7 @@ def _run_network_checks(
     if f:
         findings.append(f)
 
-    f = _check_public_ip_assignment(ec2_client, svc, subnet_ids)
+    f = _check_public_ip_assignment(ec2_client, svc, subnet_ids, region, account_id)
     if f:
         findings.append(f)
 
@@ -348,7 +393,11 @@ def diagnose_network(
     sg_ids: list[str] = network_config.get("securityGroups", [])
 
     if not subnet_ids and not sg_ids:
-        subnet_ids, sg_ids = _get_task_network_details(ecs_client, cluster, service)
+        subnet_ids, sg_ids, iam = _get_task_network_details(
+            ecs_client, cluster, service, region, account_id
+        )
+        if iam:
+            return [iam]
 
     if not subnet_ids and not sg_ids:
         return []
