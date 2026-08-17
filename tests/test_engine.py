@@ -330,3 +330,80 @@ class TestRunDiagnosis:
         assert FindingType.ALB_UNHEALTHY in types
         error_findings = [f for f in result.all_findings if f.type == FindingType.IAM_DENIED]
         assert all(f.severity == Severity.LOW for f in error_findings)
+
+    def test_logs_start_before_slow_metrics_finish(self):
+        import threading
+        import time
+
+        metrics_done = threading.Event()
+        logs_overlapped = []
+
+        def slow_metrics(**_kwargs):
+            time.sleep(0.2)
+            metrics_done.set()
+            return [], None
+
+        def logs(**_kwargs):
+            logs_overlapped.append(not metrics_done.is_set())
+            return []
+
+        with (
+            patch(_PATCH_EVENTS, return_value=[]),
+            patch(_PATCH_STOP, return_value=([], ["arn:task"])),
+            patch(_PATCH_LOGS, side_effect=logs),
+            patch(_PATCH_ALB, return_value=[]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(_PATCH_NETWORK, return_value=[]),
+            patch("ecs_doctor.diagnosers.metrics.diagnose_metrics", side_effect=slow_metrics),
+        ):
+            run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=True, include_config=False,
+            )
+        assert logs_overlapped == [True]
+
+    def test_deep_false_does_not_probe(self):
+        with (
+            patch(_PATCH_EVENTS, return_value=[]),
+            patch(_PATCH_STOP, return_value=([], [])),
+            patch(_PATCH_LOGS, return_value=[]) as mock_logs,
+            patch(_PATCH_ALB, return_value=[]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(_PATCH_NETWORK, return_value=[]),
+            patch("ecs_doctor.diagnosers.deep.diagnose_deep") as mock_deep,
+        ):
+            run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+                deep=False,
+            )
+        mock_deep.assert_not_called()
+        assert mock_logs.call_args.kwargs.get("deep") is not True
+
+    def test_deep_true_includes_probe_findings(self):
+        extra = _finding(FindingType.IMAGE_NOT_FOUND)
+        with (
+            patch(_PATCH_EVENTS, return_value=[]),
+            patch(_PATCH_STOP, return_value=([_finding(FindingType.IMAGE_PULL_FAILURE)], [])),
+            patch(_PATCH_LOGS, return_value=[]),
+            patch(_PATCH_ALB, return_value=[]),
+            patch(_PATCH_AGG, return_value=_root_cause()),
+            patch(_PATCH_NETWORK, return_value=[]),
+            patch("ecs_doctor.diagnosers.deep.diagnose_deep", return_value=[extra]) as mock_deep,
+        ):
+            result = run_diagnosis(
+                ecs_client=MagicMock(), logs_client=MagicMock(),
+                elb_client=MagicMock(), cw_client=MagicMock(),
+                ec2_client=MagicMock(),
+                request=_req(), include_metrics=False, include_config=False,
+                deep=True,
+                ecr_client=MagicMock(),
+                secrets_client=MagicMock(),
+            )
+        mock_deep.assert_called_once()
+        assert FindingType.IMAGE_NOT_FOUND in {f.type for f in result.all_findings}
+        assert FindingType.IMAGE_PULL_FAILURE in {f.type for f in result.all_findings}

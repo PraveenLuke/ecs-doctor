@@ -283,3 +283,76 @@ def test_no_cpu_spike_when_avg_already_critical():
     cpu_findings = [f for f in findings if f.type == FindingType.HIGH_CPU_UTILIZATION]
     assert len(cpu_findings) == 1   # only one finding, not two
     assert cpu_findings[0].severity == Severity.HIGH
+
+
+def test_alb_5xx_produces_finding():
+    from tests.conftest import make_service_cache
+
+    tg_arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:targetgroup/my-tg/abc123"
+    lb_arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/app/my-alb/50dc6c495c0c9d80"
+    ecs = make_ecs_client(describe_services={
+        "services": [{"loadBalancers": [{"targetGroupArn": tg_arn}]}]
+    })
+    elb = make_ecs_client(describe_target_groups={
+        "TargetGroups": [{"TargetGroupArn": tg_arn, "LoadBalancerArns": [lb_arn]}]
+    })
+    now = datetime.now(timezone.utc)
+    cw = _make_cw(get_metric_data={
+        "MetricDataResults": [
+            {"Id": "cpu_avg", "Values": [10.0], "Timestamps": [now]},
+            {"Id": "cpu_max", "Values": [12.0], "Timestamps": [now]},
+            {"Id": "mem_avg", "Values": [20.0], "Timestamps": [now]},
+            {"Id": "mem_max", "Values": [22.0], "Timestamps": [now]},
+            {"Id": "alb_5xx", "Values": [42.0], "Timestamps": [now]},
+        ]
+    })
+    findings, _ = diagnose_metrics(
+        cw_client=cw,
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+        service_cache=make_service_cache(ecs),
+        elbv2_client=elb,
+    )
+    assert any(f.type == FindingType.ALB_TARGET_5XX for f in findings)
+    f = next(x for x in findings if x.type == FindingType.ALB_TARGET_5XX)
+    assert f.severity == Severity.HIGH
+    assert "5xx" in f.message.lower() or "5XX" in f.message
+
+
+def test_alb_unhealthy_host_count_produces_finding():
+    from tests.conftest import make_service_cache
+
+    tg_arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:targetgroup/my-tg/abc123"
+    lb_arn = f"arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT}:loadbalancer/app/my-alb/50dc6c495c0c9d80"
+    ecs = make_ecs_client(describe_services={
+        "services": [{"loadBalancers": [{"targetGroupArn": tg_arn}]}]
+    })
+    elb = make_ecs_client(describe_target_groups={
+        "TargetGroups": [{"TargetGroupArn": tg_arn, "LoadBalancerArns": [lb_arn]}]
+    })
+    now = datetime.now(timezone.utc)
+    cw = _make_cw(get_metric_data={
+        "MetricDataResults": [
+            {"Id": "cpu_avg", "Values": [10.0], "Timestamps": [now]},
+            {"Id": "cpu_max", "Values": [12.0], "Timestamps": [now]},
+            {"Id": "mem_avg", "Values": [20.0], "Timestamps": [now]},
+            {"Id": "mem_max", "Values": [22.0], "Timestamps": [now]},
+            {"Id": "alb_5xx", "Values": [0.0], "Timestamps": [now]},
+            {"Id": "alb_unhealthy", "Values": [3.0], "Timestamps": [now]},
+        ]
+    })
+    findings, _ = diagnose_metrics(
+        cw_client=cw,
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+        service_cache=make_service_cache(ecs),
+        elbv2_client=elb,
+    )
+    assert any(f.type == FindingType.ALB_UNHEALTHY for f in findings)
+    f = next(x for x in findings if x.type == FindingType.ALB_UNHEALTHY)
+    assert f.source == "metrics"
+    assert "unhealthy" in f.message.lower()

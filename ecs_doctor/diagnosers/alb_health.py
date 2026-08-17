@@ -199,4 +199,46 @@ def _check_target_group(elbv2_client, tg_arn: str) -> list[Finding]:
         )
         if finding:
             findings.append(finding)
+    findings.extend(_check_target_group_config(
+        elbv2_client,
+        tg_arn,
+        has_unhealthy=any(f.type == FindingType.ALB_UNHEALTHY for f in findings),
+    ))
     return findings
+
+
+def _check_target_group_config(elbv2_client, tg_arn: str, has_unhealthy: bool) -> list[Finding]:
+    """Inspect target-group health-check settings. Always called so IAM denials surface."""
+    try:
+        resp = elbv2_client.describe_target_groups(TargetGroupArns=[tg_arn])
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [iam_finding(
+                "elasticloadbalancing:DescribeTargetGroups",
+                tg_arn,
+                "alb_health",
+            )]
+        raise
+
+    groups = resp.get("TargetGroups", [])
+    if not isinstance(groups, list) or not groups:
+        return []
+    tg = groups[0]
+    path = tg.get("HealthCheckPath", "")
+    if has_unhealthy and path == "/":
+        return [Finding(
+            type=FindingType.HEALTH_CHECK_FAIL,
+            message=(
+                f"Target group health check path is '/'. "
+                "Many applications do not return HTTP 200 on GET / — "
+                "set HealthCheckPath to a dedicated endpoint such as /health."
+            ),
+            severity=Severity.MEDIUM,
+            raw_data={
+                "tg_arn": tg_arn,
+                "health_check_path": path,
+                "matcher": tg.get("Matcher"),
+            },
+            source="alb_health",
+        )]
+    return []

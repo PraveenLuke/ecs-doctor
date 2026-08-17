@@ -13,6 +13,10 @@ _EXIT_SIGILL = 132
 _EXIT_NOT_EXECUTABLE = 126
 _EXIT_COMMAND_NOT_FOUND = 127
 _STOPPED_STATUS = "STOPPED"
+_RUNNING_STATUS = "RUNNING"
+_MAX_STOPPED_LIST = 100
+_MAX_RUNNING_FOR_LOGS = 10
+_DEFAULT_MAX_CLASSIFY = 20
 _ESSENTIAL_LOWER = "essential container"
 _CANNOT_PULL_LOWER = "cannotpullcontainererror"
 _CANNOT_START_LOWER = "cannotstartcontainererror"
@@ -338,42 +342,64 @@ def _buckets_to_findings(buckets: dict[tuple, list[dict]]) -> list[Finding]:
 # Public diagnoser
 # ---------------------------------------------------------------------------
 
+def _list_task_arns(ecs_client, cluster: str, service: str, status: str, max_results: int) -> list[str]:
+    resp = ecs_client.list_tasks(
+        cluster=cluster,
+        serviceName=service,
+        desiredStatus=status,
+        maxResults=max_results,
+    )
+    return resp.get("taskArns", [])
+
+
+def _stopped_sort_key(task: dict) -> str:
+    return str(task.get("stoppedAt") or "")
+
+
 def diagnose_stop_reasons(
     ecs_client,
     cluster: str,
     service: str,
     region: str,
     account_id: str,
-    max_tasks: int = 10,
+    max_tasks: int = _MAX_STOPPED_LIST,
+    max_classify: int = _DEFAULT_MAX_CLASSIFY,
 ) -> tuple[list[Finding], list[str]]:
     cluster_arn = cluster_resource_arn(region, account_id, cluster)
 
     try:
-        list_resp = ecs_client.list_tasks(
-            cluster=cluster,
-            serviceName=service,
-            desiredStatus=_STOPPED_STATUS,
-            maxResults=max_tasks,
+        stopped_arns = _list_task_arns(
+            ecs_client, cluster, service, _STOPPED_STATUS, min(max_tasks, _MAX_STOPPED_LIST)
         )
     except ClientError as exc:
         if is_access_denied(exc):
             return [iam_finding("ecs:ListTasks", cluster_arn, "stop_reasons")], []
         raise
 
-    task_arns: list[str] = list_resp.get("taskArns", [])
-    if not task_arns:
-        return [], []
-
     try:
-        desc_resp = ecs_client.describe_tasks(cluster=cluster, tasks=task_arns)
+        running_arns = _list_task_arns(
+            ecs_client, cluster, service, _RUNNING_STATUS, _MAX_RUNNING_FOR_LOGS
+        )
     except ClientError as exc:
         if is_access_denied(exc):
-            return [iam_finding("ecs:DescribeTasks", cluster_arn, "stop_reasons")], task_arns
+            running_arns = []
+        else:
+            raise
+
+    if not stopped_arns:
+        return [], running_arns
+
+    try:
+        desc_resp = ecs_client.describe_tasks(cluster=cluster, tasks=stopped_arns)
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [iam_finding("ecs:DescribeTasks", cluster_arn, "stop_reasons")], running_arns + stopped_arns
         raise
 
+    sampled = sorted(desc_resp.get("tasks", []), key=_stopped_sort_key, reverse=True)[:max_classify]
     buckets: dict[tuple, list[dict]] = defaultdict(list)
 
-    for task in desc_resp.get("tasks", []):
+    for task in sampled:
         task_arn = task.get("taskArn", "unknown")
         stop_code = task.get("stopCode", "")
         stopped_reason = task.get("stoppedReason", "")
@@ -397,4 +423,6 @@ def diagnose_stop_reasons(
                 key, entry = result
                 buckets[key].append(entry)
 
-    return _buckets_to_findings(buckets), task_arns
+    sampled_arns = [t.get("taskArn", "") for t in sampled if t.get("taskArn")]
+    log_arns = list(dict.fromkeys([*running_arns, *sampled_arns]))
+    return _buckets_to_findings(buckets), log_arns

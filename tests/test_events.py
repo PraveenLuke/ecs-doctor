@@ -145,6 +145,17 @@ def test_access_denied_uses_correct_arn():
     assert SERVICE in findings[0].message
 
 
+def test_service_not_found_is_not_iam_denied():
+    ecs = make_ecs_client(describe_services={"services": []})
+    findings = diagnose_events(make_service_cache(ecs), CLUSTER, SERVICE, REGION, ACCOUNT)
+    assert len(findings) == 1
+    assert findings[0].type == FindingType.SERVICE_NOT_FOUND
+    assert findings[0].type != FindingType.IAM_DENIED
+    assert SERVICE in findings[0].message
+    assert CLUSTER in findings[0].message
+    assert findings[0].severity == Severity.HIGH
+
+
 # ---------------------------------------------------------------------------
 # Deduplication — same pattern should not produce two findings of same type
 # ---------------------------------------------------------------------------

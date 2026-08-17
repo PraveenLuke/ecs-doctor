@@ -162,6 +162,14 @@ class TestHelp:
         assert "--service" in result.output
         assert "--json" in result.output
         assert "--region" in result.output
+        assert "--deep" in result.output
+
+    def test_serve_defaults_to_localhost(self):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["serve", "--help"])
+        assert result.exit_code == 0
+        assert "127.0.0.1" in result.output
+        assert "0.0.0.0" not in result.output
 
 
 class TestDiagnoseRichOutput:
@@ -318,6 +326,32 @@ class TestErrorHandling:
             )
         assert result.exit_code == 0
         ms.assert_called_once_with(region_name=None, profile_name="my-profile")
+
+    def test_deep_flag_passed_to_engine(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result()
+            result = runner.invoke(
+                cli, ["diagnose", "--cluster", "c", "--service", "s", "--deep"]
+            )
+        assert result.exit_code == 0
+        assert me.call_args.kwargs.get("deep") is True
+
+    def test_deep_false_by_default(self):
+        runner = CliRunner()
+        with (
+            patch(PATCH_SESSION) as ms,
+            patch(PATCH_ENGINE) as me,
+        ):
+            ms.return_value = _make_session()
+            me.return_value = _make_result()
+            result = runner.invoke(cli, ["diagnose", "--cluster", "c", "--service", "s"])
+        assert result.exit_code == 0
+        assert me.call_args.kwargs.get("deep") is False
 
 
 # ---------------------------------------------------------------------------

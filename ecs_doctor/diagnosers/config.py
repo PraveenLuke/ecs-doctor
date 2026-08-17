@@ -1,7 +1,5 @@
 
-from botocore.exceptions import ClientError
-
-from ecs_doctor._aws import ServiceDataCache, _AccessDeniedCached, iam_finding, is_access_denied, service_resource_arn
+from ecs_doctor._aws import ServiceDataCache, _AccessDeniedCached, iam_finding, service_resource_arn
 from ecs_doctor.models import (
     ContainerConfig,
     DeploymentConfig,
@@ -327,13 +325,10 @@ def diagnose_config(
         return [], service_config, None
 
     try:
-        td_resp = ecs_client.describe_task_definition(taskDefinition=task_def_arn)
-    except ClientError as exc:
-        if is_access_denied(exc):
-            return [iam_finding("ecs:DescribeTaskDefinition", task_def_arn, "config")], service_config, None
-        raise
+        td = service_cache.get_task_definition(task_def_arn)
+    except _AccessDeniedCached:
+        return [iam_finding("ecs:DescribeTaskDefinition", task_def_arn, "config")], service_config, None
 
-    td = td_resp.get("taskDefinition", {})
     task_config = _extract_task_config(td)
 
     findings: list[Finding] = []

@@ -16,6 +16,77 @@ _MEMORY_ALERT_THRESHOLD = 85.0
 _MEMORY_CRITICAL_THRESHOLD = 85.0
 _MEMORY_MAX_THRESHOLD = 95.0
 _CPU_MAX_THRESHOLD = 95.0
+_ALB_NAMESPACE = "AWS/ApplicationELB"
+_ALB_5XX_METRIC = "HTTPCode_Target_5XX_Count"
+_ALB_UNHEALTHY_METRIC = "UnHealthyHostCount"
+
+
+def _alb_dimension_from_arn(arn: str, kind: str) -> str | None:
+    """Extract ALB/TG CloudWatch dimension from an ARN.
+
+    loadbalancer/app/name/id → app/name/id
+    targetgroup/name/id → targetgroup/name/id
+    """
+    marker = f"{kind}/"
+    idx = arn.find(marker)
+    if idx < 0:
+        return None
+    return arn[idx:]
+
+
+def _alb_metric_queries(elbv2_client, tg_arn: str, period_seconds: int) -> list[dict]:
+    try:
+        resp = elbv2_client.describe_target_groups(TargetGroupArns=[tg_arn])
+    except ClientError:
+        return []
+    groups = resp.get("TargetGroups") or []
+    if not isinstance(groups, list) or not groups:
+        return []
+    lb_arns = groups[0].get("LoadBalancerArns") or []
+    if not lb_arns:
+        return []
+    lb_dim = _alb_dimension_from_arn(lb_arns[0], "app")
+    tg_dim = _alb_dimension_from_arn(tg_arn, "targetgroup")
+    if not lb_dim or not tg_dim:
+        return []
+    dimensions = [
+        {"Name": "LoadBalancer", "Value": lb_dim},
+        {"Name": "TargetGroup", "Value": tg_dim},
+    ]
+
+    def _query(query_id: str, metric: str, stat: str) -> dict:
+        return {
+            "Id": query_id,
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": _ALB_NAMESPACE,
+                    "MetricName": metric,
+                    "Dimensions": dimensions,
+                },
+                "Period": period_seconds,
+                "Stat": stat,
+            },
+        }
+
+    return [
+        _query("alb_5xx", _ALB_5XX_METRIC, "Sum"),
+        _query("alb_unhealthy", _ALB_UNHEALTHY_METRIC, "Maximum"),
+    ]
+
+
+def _first_target_group_arn(service_cache, cluster: str, service: str, region: str, account_id: str) -> str | None:
+    from ecs_doctor._aws import _AccessDeniedCached
+    try:
+        svc = service_cache.get_service(cluster, service, region, account_id)
+    except _AccessDeniedCached:
+        return None
+    if not svc:
+        return None
+    for lb in svc.get("loadBalancers", []):
+        tg_arn = lb.get("targetGroupArn")
+        if tg_arn:
+            return tg_arn
+    return None
 
 
 def _build_metric_queries(
@@ -190,11 +261,17 @@ def diagnose_metrics(
     account_id: str,
     lookback_hours: int = _DEFAULT_LOOKBACK_HOURS,
     period_seconds: int = _DEFAULT_PERIOD,
+    service_cache=None,
+    elbv2_client=None,
 ) -> tuple[list[Finding], MetricSnapshot | None]:
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=lookback_hours)
 
     queries = _build_metric_queries(cluster, service, period_seconds)
+    if service_cache is not None and elbv2_client is not None:
+        tg_arn = _first_target_group_arn(service_cache, cluster, service, region, account_id)
+        if tg_arn:
+            queries.extend(_alb_metric_queries(elbv2_client, tg_arn, period_seconds))
 
     try:
         resp = cw_client.get_metric_data(
@@ -216,4 +293,30 @@ def diagnose_metrics(
         cluster, service, values, timestamps, lookback_hours, period_seconds
     )
     findings = _anomaly_findings(snapshot, cluster, service)
+    alb_5xx_values = values.get("alb_5xx", [])
+    if alb_5xx_values and sum(alb_5xx_values) > 0:
+        total = round(sum(alb_5xx_values), 1)
+        findings.append(Finding(
+            type=FindingType.ALB_TARGET_5XX,
+            message=(
+                f"ALB targets returned {total:.0f} HTTP 5xx responses over the last "
+                f"{lookback_hours}h for {cluster}/{service}."
+            ),
+            severity=Severity.HIGH,
+            raw_data={"alb_5xx_sum": total, "lookback_hours": lookback_hours},
+            source="metrics",
+        ))
+    alb_unhealthy_values = values.get("alb_unhealthy", [])
+    if alb_unhealthy_values and max(alb_unhealthy_values) > 0:
+        peak = round(max(alb_unhealthy_values), 1)
+        findings.append(Finding(
+            type=FindingType.ALB_UNHEALTHY,
+            message=(
+                f"ALB UnHealthyHostCount reached {peak:.0f} over the last "
+                f"{lookback_hours}h for {cluster}/{service}."
+            ),
+            severity=Severity.HIGH,
+            raw_data={"alb_unhealthy_max": peak, "lookback_hours": lookback_hours},
+            source="metrics",
+        ))
     return findings, snapshot

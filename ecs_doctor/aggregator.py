@@ -29,6 +29,13 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "For Fargate, confirm the subnet has a NAT gateway or VPC endpoint for ECR. "
         "DockerHub rate limiting can also cause this — consider mirroring to ECR.",
     ),
+    FindingType.IMAGE_NOT_FOUND: (
+        "Container image does not exist in ECR",
+        0.98,
+        "The tag or digest in the task definition is not in the ECR repository. "
+        "Push the image, or correct the image URI in the task definition. "
+        "A missing tag is more common than a deleted repository after a CI rename.",
+    ),
     FindingType.SECRETS_INIT_FAILURE: (
         "Task cannot initialize — secret or config resource is missing or inaccessible",
         0.95,
@@ -36,6 +43,13 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "Verify the secret exists in Secrets Manager / SSM Parameter Store. "
         "Ensure the task execution role has secretsmanager:GetSecretValue or ssm:GetParameter. "
         "For S3 environment files, add s3:GetObject to the execution role.",
+    ),
+    FindingType.SECRET_NOT_FOUND: (
+        "Secret or SSM parameter does not exist",
+        0.98,
+        "The valueFrom ARN in the task definition points at a secret or parameter that is gone. "
+        "Create it, restore it, or update the task definition to the correct ARN. "
+        "Names are region-specific; a secret in another region will not resolve.",
     ),
     FindingType.PLACEMENT_FAILURE: (
         "ECS cannot schedule tasks — insufficient cluster capacity",
@@ -180,6 +194,13 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "Set JVM heap size (-Xmx) to 75% of the container memory limit for Java services. "
         "Enable CloudWatch Container Insights for trend-based alerting.",
     ),
+    FindingType.ALB_TARGET_5XX: (
+        "ALB targets are returning HTTP 5xx — the application is erroring under traffic",
+        0.80,
+        "Check application logs for unhandled exceptions during the same window. "
+        "Verify downstream dependencies (database, cache, other services) are healthy. "
+        "If 5xx started after a deploy, roll back the task definition revision.",
+    ),
     FindingType.INVALID_TASK_CONFIG: (
         "Task definition has an invalid Fargate CPU/memory combination",
         0.90,
@@ -293,6 +314,13 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "from the ALB security group (preferred) or the VPC CIDR. "
         "Avoid opening 0.0.0.0/0 — scope the source to the ALB security group ID instead.",
     ),
+    FindingType.SERVICE_NOT_FOUND: (
+        "ECS service was not found in the cluster",
+        0.95,
+        "Verify the cluster name and service name. "
+        "Run ecs-doctor browse, or aws ecs list-services --cluster <cluster>, to list services. "
+        "Names are case-sensitive and must match the ECS service name, not the task family.",
+    ),
     FindingType.IAM_DENIED: (
         "Diagnosis incomplete — IAM permissions are blocking one or more checks",
         0.50,
@@ -300,6 +328,48 @@ _HYPOTHESIS: dict[FindingType, tuple[str, float, str]] = {
         "Re-run ecs-doctor after updating permissions to get a full diagnosis.",
     ),
 }
+
+
+_FUSION_GROUPS: list[tuple[frozenset[FindingType], FindingType, float]] = [
+    (
+        frozenset({FindingType.OOM_KILLED, FindingType.HIGH_MEMORY_UTILIZATION}),
+        FindingType.OOM_KILLED,
+        1.0,
+    ),
+    (
+        frozenset({FindingType.IMAGE_NOT_FOUND, FindingType.IMAGE_PULL_FAILURE}),
+        FindingType.IMAGE_NOT_FOUND,
+        0.5,
+    ),
+    (
+        frozenset({FindingType.SECRET_NOT_FOUND, FindingType.SECRETS_INIT_FAILURE}),
+        FindingType.SECRET_NOT_FOUND,
+        0.5,
+    ),
+]
+
+
+def _fuse_related_hypotheses(
+    findings: list[Finding],
+    scores: dict[str, float],
+    evidence_map: dict[str, list[Finding]],
+) -> None:
+    """Fold correlated finding types onto a single root-cause label."""
+    present = {f.type for f in findings}
+    type_to_label = {ftype: spec[0] for ftype, spec in _HYPOTHESIS.items()}
+    for required, target, bonus in _FUSION_GROUPS:
+        if not required <= present:
+            continue
+        target_label = type_to_label[target]
+        for ftype in required:
+            if ftype == target:
+                continue
+            src_label = type_to_label.get(ftype)
+            if src_label and src_label in scores and src_label != target_label:
+                scores[target_label] += scores[src_label]
+                evidence_map[target_label].extend(evidence_map[src_label])
+                scores[src_label] = 0.0
+        scores[target_label] += bonus
 
 
 def aggregate(findings: list[Finding]) -> RootCause:
@@ -340,6 +410,8 @@ def aggregate(findings: list[Finding]) -> RootCause:
             evidence=findings,
             suggested_fix="Review the raw findings above for clues.",
         )
+
+    _fuse_related_hypotheses(findings, scores, evidence_map)
 
     best_label = max(scores, key=scores.__getitem__)
     raw_score = scores[best_label]
