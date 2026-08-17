@@ -28,7 +28,7 @@ ECS Doctor runs **7 parallel diagnostic checks** across the AWS APIs that matter
 | **Service events** | `ecs:DescribeServices` | Why your deployment stalled, rolled back, or never reached steady state |
 | **Stop reasons** | `ecs:ListTasks`, `ecs:DescribeTasks` | Why your container stopped — OOM, bad image, missing secrets, startup failures, and more |
 | **CloudWatch Logs** | `logs:GetLogEvents` | Crash signatures across Python, Java, Go, Node.js, and 5 other runtimes — without you grepping |
-| **ALB health** | `elasticloadbalancing:DescribeTargetHealth`, `DescribeTargetGroups` | Why your load balancer is dropping traffic — including health-check path mismatches |
+| **ALB health** | `elasticloadbalancing:DescribeTargetHealth`, `elasticloadbalancing:DescribeTargetGroups` | Why your load balancer is dropping traffic — including health-check path mismatches |
 | **Metrics** | `cloudwatch:GetMetricData` | CPU, memory, ALB 5xx, and unhealthy host count |
 | **Task config** | `ecs:DescribeTaskDefinition` | Misconfiguration in your task definition or service that will silently break deployments |
 | **Network** | `ec2:Describe*` | Connectivity issues blocking your tasks from reaching AWS services or the internet |

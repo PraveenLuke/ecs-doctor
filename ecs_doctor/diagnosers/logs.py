@@ -1,5 +1,6 @@
 
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -275,10 +276,13 @@ def _filter_log_groups(
         events = resp.get("events", [])
         if not events:
             continue
-        log_lines = [e.get("message", "") for e in events]
-        stream_name = events[0].get("logStreamName", "")
-        task_id = stream_name.split("/")[-1] if stream_name else "unknown"
-        findings.extend(_scan_lines(log_lines, "filtered", task_id, log_group, stream_name))
+        by_stream: dict[str, list[str]] = defaultdict(list)
+        for event in events:
+            stream_name = event.get("logStreamName") or ""
+            by_stream[stream_name].append(event.get("message", ""))
+        for stream_name, log_lines in by_stream.items():
+            task_id = stream_name.split("/")[-1] if stream_name else "unknown"
+            findings.extend(_scan_lines(log_lines, "filtered", task_id, log_group, stream_name))
     return findings
 
 

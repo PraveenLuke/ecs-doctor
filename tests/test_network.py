@@ -408,6 +408,19 @@ def test_list_tasks_access_denied_without_awsvpc_returns_iam_finding():
     assert "ecs:ListTasks" in f.message
 
 
+def test_describe_tasks_access_denied_without_awsvpc_returns_iam_finding():
+    ecs = make_ecs_client(
+        describe_services={"services": [{"networkConfiguration": {}, "loadBalancers": []}]},
+        list_tasks={"taskArns": [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/abc"]},
+        describe_tasks=access_denied_error("DescribeTasks"),
+    )
+    ec2 = make_ecs_client()
+    findings = _call(ecs, ec2)
+    assert any(f.type == FindingType.IAM_DENIED for f in findings)
+    f = next(x for x in findings if x.type == FindingType.IAM_DENIED)
+    assert "ecs:DescribeTasks" in f.message
+
+
 def test_public_ip_check_access_denied_returns_iam_finding():
     ecs = make_ecs_client(describe_services=_svc_with_lb(assign_public_ip="DISABLED"))
     ec2 = make_ecs_client(

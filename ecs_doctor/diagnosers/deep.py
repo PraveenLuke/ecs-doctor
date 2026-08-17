@@ -31,6 +31,7 @@ _SSM_ARN_RE = re.compile(
 _IMAGE_MISSING_CODES = frozenset({"ImageNotFoundException", "RepositoryNotFoundException"})
 _SECRET_MISSING_CODES = frozenset({"ResourceNotFoundException"})
 _SSM_MISSING_CODES = frozenset({"ParameterNotFound"})
+_SECRET_ARN_PREFIX_PARTS = 7  # arn:partition:secretsmanager:region:account:secret:name
 
 
 def _error_code(exc: ClientError) -> str:
@@ -54,6 +55,33 @@ def parse_ecr_image(uri: str) -> dict[str, str | None] | None:
 def parse_secret_arns(text: str) -> list[str]:
     found = _SECRET_ARN_RE.findall(text) + _SSM_ARN_RE.findall(text)
     return list(dict.fromkeys(found))
+
+
+def _secrets_manager_base_arn(arn: str) -> str:
+    """Strip ECS valueFrom JSON-key / version-stage / version-id selectors."""
+    parts = arn.split(":")
+    if len(parts) <= _SECRET_ARN_PREFIX_PARTS:
+        return arn
+    return ":".join(parts[:_SECRET_ARN_PREFIX_PARTS])
+
+
+def _ecr_client_for(ecr_client, region: str, cache: dict) -> object:
+    if region in cache:
+        return cache[region]
+    meta = getattr(ecr_client, "meta", None)
+    client_region = getattr(meta, "region_name", None)
+    if not isinstance(client_region, str) or client_region == region:
+        cache[region] = ecr_client
+        return ecr_client
+    session = getattr(meta, "session", None)
+    regional = None
+    if session is not None:
+        try:
+            regional = session.client("ecr", region_name=region)
+        except Exception:  # noqa: BLE001
+            regional = None
+    cache[region] = regional or ecr_client
+    return cache[region]
 
 
 def _task_definition_images(service_cache: ServiceDataCache, cluster: str, service: str, region: str, account_id: str) -> list[str]:
@@ -104,7 +132,7 @@ def _secret_arns_to_probe(findings: list[Finding]) -> list[str]:
     return list(dict.fromkeys(arns))
 
 
-def _probe_ecr_image(ecr_client, image_uri: str, region: str, account_id: str) -> list[Finding]:
+def _probe_ecr_image(ecr_client, image_uri: str, client_cache: dict) -> list[Finding]:
     parsed = parse_ecr_image(image_uri)
     if parsed is None:
         return []
@@ -118,8 +146,15 @@ def _probe_ecr_image(ecr_client, image_uri: str, region: str, account_id: str) -
         image_ids.append({"imageTag": "latest"})
 
     repo = parsed["repository"]
+    img_region = parsed["region"] or ""
+    img_account = parsed["account"] or ""
+    client = _ecr_client_for(ecr_client, img_region, client_cache)
     try:
-        ecr_client.describe_images(repositoryName=repo, imageIds=image_ids)
+        client.describe_images(
+            registryId=img_account,
+            repositoryName=repo,
+            imageIds=image_ids,
+        )
     except ClientError as exc:
         code = _error_code(exc)
         if code in _IMAGE_MISSING_CODES:
@@ -137,7 +172,7 @@ def _probe_ecr_image(ecr_client, image_uri: str, region: str, account_id: str) -
         if is_access_denied(exc):
             return [iam_finding(
                 "ecr:DescribeImages",
-                f"arn:aws:ecr:{region}:{account_id}:repository/{repo}",
+                f"arn:aws:ecr:{img_region}:{img_account}:repository/{repo}",
                 _SOURCE,
             )]
         raise
@@ -155,8 +190,9 @@ def _probe_ecr_image(ecr_client, image_uri: str, region: str, account_id: str) -
 
 
 def _probe_secret(secrets_client, arn: str) -> list[Finding]:
+    secret_id = _secrets_manager_base_arn(arn)
     try:
-        secrets_client.describe_secret(SecretId=arn)
+        secrets_client.describe_secret(SecretId=secret_id)
     except ClientError as exc:
         code = _error_code(exc)
         if code in _SECRET_MISSING_CODES:
@@ -167,11 +203,11 @@ def _probe_secret(secrets_client, arn: str) -> list[Finding]:
                     "Fix the valueFrom ARN in the task definition."
                 ),
                 severity=Severity.CRITICAL,
-                raw_data={"secretArn": arn},
+                raw_data={"secretArn": arn, "secretId": secret_id},
                 source=_SOURCE,
             )]
         if is_access_denied(exc):
-            return [iam_finding("secretsmanager:DescribeSecret", arn, _SOURCE)]
+            return [iam_finding("secretsmanager:DescribeSecret", secret_id, _SOURCE)]
         raise
     return [Finding(
         type=FindingType.SECRETS_INIT_FAILURE,
@@ -180,7 +216,7 @@ def _probe_secret(secrets_client, arn: str) -> list[Finding]:
             "Init failure is likely execution-role secretsmanager:GetSecretValue, KMS, or VPC endpoint."
         ),
         severity=Severity.HIGH,
-        raw_data={"secretArn": arn, "exists": True},
+        raw_data={"secretArn": arn, "secretId": secret_id, "exists": True},
         source=_SOURCE,
     )]
 
@@ -232,8 +268,9 @@ def diagnose_deep(
 ) -> list[Finding]:
     extra: list[Finding] = []
     if ecr_client is not None:
+        ecr_by_region: dict = {}
         for image in _images_to_probe(findings, service_cache, cluster, service, region, account_id):
-            extra.extend(_probe_ecr_image(ecr_client, image, region, account_id))
+            extra.extend(_probe_ecr_image(ecr_client, image, ecr_by_region))
 
     if secrets_client is not None or ssm_client is not None:
         for arn in _secret_arns_to_probe(findings):

@@ -218,6 +218,7 @@ def test_empty_target_group_produces_no_alb_targets_finding():
     f = next(x for x in findings if x.type == FindingType.NO_ALB_TARGETS)
     assert f.severity == Severity.HIGH
     assert f.raw_data["tg_arn"] == _TG_ARN
+    elb.describe_target_groups.assert_called()
 
 
 # ---------------------------------------------------------------------------

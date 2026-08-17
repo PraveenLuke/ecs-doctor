@@ -1,5 +1,6 @@
 
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 from botocore.exceptions import ClientError
@@ -342,6 +343,9 @@ def _buckets_to_findings(buckets: dict[tuple, list[dict]]) -> list[Finding]:
 # Public diagnoser
 # ---------------------------------------------------------------------------
 
+_MISSING_STOPPED_AT = datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _list_task_arns(ecs_client, cluster: str, service: str, status: str, max_results: int) -> list[str]:
     resp = ecs_client.list_tasks(
         cluster=cluster,
@@ -352,8 +356,24 @@ def _list_task_arns(ecs_client, cluster: str, service: str, status: str, max_res
     return resp.get("taskArns", [])
 
 
-def _stopped_sort_key(task: dict) -> str:
-    return str(task.get("stoppedAt") or "")
+def _parse_stopped_at(value: object) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return _MISSING_STOPPED_AT
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return _MISSING_STOPPED_AT
+
+
+def _stopped_sort_key(task: dict) -> datetime:
+    return _parse_stopped_at(task.get("stoppedAt"))
 
 
 def diagnose_stop_reasons(
@@ -393,7 +413,10 @@ def diagnose_stop_reasons(
         desc_resp = ecs_client.describe_tasks(cluster=cluster, tasks=stopped_arns)
     except ClientError as exc:
         if is_access_denied(exc):
-            return [iam_finding("ecs:DescribeTasks", cluster_arn, "stop_reasons")], running_arns + stopped_arns
+            return [iam_finding("ecs:DescribeTasks", cluster_arn, "stop_reasons")], [
+                *running_arns,
+                *stopped_arns[:max_classify],
+            ]
         raise
 
     sampled = sorted(desc_resp.get("tasks", []), key=_stopped_sort_key, reverse=True)[:max_classify]

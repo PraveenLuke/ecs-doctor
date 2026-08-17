@@ -174,8 +174,9 @@ def _check_target_group(elbv2_client, tg_arn: str) -> list[Finding]:
         raise
 
     descriptions = health_resp.get("TargetHealthDescriptions", [])
+    findings: list[Finding] = []
     if not descriptions:
-        return [Finding(
+        findings.append(Finding(
             type=FindingType.NO_ALB_TARGETS,
             message=(
                 f"Target group {tg_arn} has no registered targets. "
@@ -185,9 +186,10 @@ def _check_target_group(elbv2_client, tg_arn: str) -> list[Finding]:
             severity=Severity.HIGH,
             raw_data={"tg_arn": tg_arn},
             source="alb_health",
-        )]
+        ))
+        findings.extend(_check_target_group_config(elbv2_client, tg_arn, has_unhealthy=False))
+        return findings
 
-    findings: list[Finding] = []
     for desc in descriptions:
         health = desc.get("TargetHealth", {})
         finding = _finding_for_target(
@@ -229,7 +231,7 @@ def _check_target_group_config(elbv2_client, tg_arn: str, has_unhealthy: bool) -
         return [Finding(
             type=FindingType.HEALTH_CHECK_FAIL,
             message=(
-                f"Target group health check path is '/'. "
+                "Target group health check path is '/'. "
                 "Many applications do not return HTTP 200 on GET / — "
                 "set HealthCheckPath to a dedicated endpoint such as /health."
             ),

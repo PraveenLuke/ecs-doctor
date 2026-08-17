@@ -456,6 +456,28 @@ def test_deep_filter_log_events_access_denied_is_iam_finding():
     assert any("logs:FilterLogEvents" in f.message for f in findings)
 
 
+def test_deep_filter_log_events_groups_by_stream():
+    ecs = _make_ecs()
+    logs = make_logs_client(
+        get_log_events=_log_events(["healthy"]),
+        filter_log_events={
+            "events": [
+                {"message": "panic: boom", "logStreamName": "ecs/app/task-a"},
+                {"message": "Traceback (most recent call last)", "logStreamName": "ecs/app/task-b"},
+            ]
+        },
+    )
+    findings = _call(ecs, logs, deep=True)
+    panic = [f for f in findings if "Go panic" in f.message]
+    traceback = [f for f in findings if "Python traceback" in f.message]
+    assert panic
+    assert traceback
+    assert panic[0].raw_data["task_id"] == "task-a"
+    assert traceback[0].raw_data["task_id"] == "task-b"
+    assert panic[0].raw_data["log_stream"] == "ecs/app/task-a"
+    assert traceback[0].raw_data["log_stream"] == "ecs/app/task-b"
+
+
 def test_no_log_driver_emits_advisory():
     ecs = make_ecs_client(
         describe_services=_svc_resp(),

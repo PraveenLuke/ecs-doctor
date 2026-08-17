@@ -247,6 +247,25 @@ def test_access_denied_on_describe_tasks():
     assert _TASK_ARN in arns
 
 
+def test_describe_tasks_access_denied_caps_stopped_arns_for_logs():
+    stopped = [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/stopped{i}" for i in range(30)]
+    running = [f"arn:aws:ecs:{REGION}:{ACCOUNT}:task/{CLUSTER}/running"]
+    ecs = make_ecs_client(describe_tasks=access_denied_error("DescribeTasks"))
+
+    def _list_tasks(**kwargs):
+        if kwargs.get("desiredStatus") == "RUNNING":
+            return {"taskArns": running}
+        return {"taskArns": stopped}
+
+    ecs.list_tasks.side_effect = _list_tasks
+    findings, arns = diagnose_stop_reasons(
+        ecs, CLUSTER, SERVICE, REGION, ACCOUNT, max_classify=5,
+    )
+    assert findings[0].type == FindingType.IAM_DENIED
+    assert running[0] in arns
+    assert [a for a in arns if a in stopped] == stopped[:5]
+
+
 # ---------------------------------------------------------------------------
 # task_arns passthrough
 # ---------------------------------------------------------------------------
@@ -431,7 +450,7 @@ def test_classifies_most_recently_stopped_tasks():
         containers=[_container(exit_code=137)],
     )
     newest["stoppedAt"] = "2026-08-17T12:00:00Z"
-    all_tasks = older + [newest]
+    all_tasks = [*older, newest]
     all_arns = [t["taskArn"] for t in all_tasks]
     ecs = make_ecs_client(describe_tasks={"tasks": all_tasks})
 

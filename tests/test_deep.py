@@ -251,3 +251,113 @@ def test_no_ecr_client_skips_image_probe():
         account_id=ACCOUNT,
     )
     assert extra == []
+
+
+def test_secret_arn_with_json_key_selector_uses_base_arn():
+    qualified = f"{_SECRET_ARN}:password::"
+    secrets = make_ecs_client(describe_secret={"ARN": _SECRET_ARN, "Name": "db-password"})
+    extra = diagnose_deep(
+        findings=[_secret_finding(f"unable to retrieve secret {qualified}")],
+        service_cache=_cache_with_image(),
+        ecr_client=MagicMock(),
+        secrets_client=secrets,
+        ssm_client=MagicMock(),
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    secrets.describe_secret.assert_called_once_with(SecretId=_SECRET_ARN)
+    assert extra
+    f = extra[0]
+    assert f.raw_data["secretArn"] == qualified
+    assert f.raw_data["secretId"] == _SECRET_ARN
+
+
+def test_secret_selector_access_denied_iam_uses_base_arn():
+    qualified = f"{_SECRET_ARN}:password:AWSCURRENT:"
+    secrets = make_ecs_client(describe_secret=access_denied_error("DescribeSecret"))
+    extra = diagnose_deep(
+        findings=[_secret_finding(f"unable to retrieve secret {qualified}")],
+        service_cache=_cache_with_image(),
+        ecr_client=MagicMock(),
+        secrets_client=secrets,
+        ssm_client=MagicMock(),
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    secrets.describe_secret.assert_called_once_with(SecretId=_SECRET_ARN)
+    assert extra[0].type == FindingType.IAM_DENIED
+    assert _SECRET_ARN in extra[0].message
+    assert ":password" not in extra[0].message
+
+
+def test_cross_account_ecr_passes_registry_id():
+    other_account = "999999999999"
+    image = f"{other_account}.dkr.ecr.{REGION}.amazonaws.com/payments:1.4.2"
+    ecr = make_ecs_client(describe_images={"imageDetails": [{"imageTags": ["1.4.2"]}]})
+    extra = diagnose_deep(
+        findings=[_pull_finding(f"CannotPullContainerError: {image}")],
+        service_cache=_cache_with_image(image),
+        ecr_client=ecr,
+        secrets_client=MagicMock(),
+        ssm_client=MagicMock(),
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    kwargs = ecr.describe_images.call_args.kwargs
+    assert kwargs["registryId"] == other_account
+    assert kwargs["repositoryName"] == "payments"
+    assert extra
+    assert extra[0].source == "deep"
+
+
+def test_cross_account_ecr_access_denied_iam_uses_image_account():
+    other_account = "999999999999"
+    image = f"{other_account}.dkr.ecr.{REGION}.amazonaws.com/payments:1.4.2"
+    ecr = make_ecs_client(describe_images=access_denied_error("DescribeImages"))
+    extra = diagnose_deep(
+        findings=[_pull_finding(f"CannotPullContainerError: {image}")],
+        service_cache=_cache_with_image(image),
+        ecr_client=ecr,
+        secrets_client=MagicMock(),
+        ssm_client=MagicMock(),
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    assert extra[0].type == FindingType.IAM_DENIED
+    assert f"arn:aws:ecr:{REGION}:{other_account}:repository/payments" in extra[0].message
+
+
+def test_cross_region_ecr_uses_cached_regional_client():
+    other_region = "eu-west-1"
+    image = f"{ACCOUNT}.dkr.ecr.{other_region}.amazonaws.com/payments:1.4.2"
+    regional = make_ecs_client(describe_images={"imageDetails": [{"imageTags": ["1.4.2"]}]})
+    ecr = make_ecs_client()
+    ecr.meta.region_name = REGION
+    session = MagicMock()
+    session.client.return_value = regional
+    ecr.meta.session = session
+    extra = diagnose_deep(
+        findings=[_pull_finding(f"CannotPullContainerError: {image}")],
+        service_cache=_cache_with_image(image),
+        ecr_client=ecr,
+        secrets_client=MagicMock(),
+        ssm_client=MagicMock(),
+        cluster=CLUSTER,
+        service=SERVICE,
+        region=REGION,
+        account_id=ACCOUNT,
+    )
+    session.client.assert_called_with("ecr", region_name=other_region)
+    ecr.describe_images.assert_not_called()
+    kwargs = regional.describe_images.call_args.kwargs
+    assert kwargs["registryId"] == ACCOUNT
+    assert extra
+    assert extra[0].source == "deep"

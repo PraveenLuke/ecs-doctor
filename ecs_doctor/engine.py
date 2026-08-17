@@ -100,13 +100,12 @@ def _safe_metrics(future) -> tuple[list[Finding], MetricSnapshot | None]:
 def _run_config(
     include_config: bool,
     cache: ServiceDataCache,
-    ecs_client,
     kwargs: dict,
 ) -> tuple[list[Finding], ServiceConfig | None, TaskConfig | None]:
     if not include_config:
         return [], None, None
     from ecs_doctor.diagnosers.config import diagnose_config
-    return diagnose_config(service_cache=cache, ecs_client=ecs_client, **kwargs)
+    return diagnose_config(service_cache=cache, **kwargs)
 
 
 def _run_metrics(
@@ -206,7 +205,7 @@ def run_diagnosis(
         f_events  = pool.submit(diagnose_events, service_cache=cache, **kwargs)
         f_stop    = pool.submit(diagnose_stop_reasons, ecs_client=ecs_client, **kwargs)
         f_alb     = pool.submit(diagnose_alb_health, service_cache=cache, elbv2_client=elb_client, **kwargs)
-        f_config  = pool.submit(_run_config, include_config, cache, ecs_client, kwargs)
+        f_config  = pool.submit(_run_config, include_config, cache, kwargs)
         f_metrics = pool.submit(_run_metrics, include_metrics, cw_client, cache, elb_client, kwargs)
         f_network = pool.submit(_run_network, cache, ecs_client, ec2_client, kwargs)
 

@@ -296,7 +296,6 @@ def _validate_depends_on_health(td: dict) -> Finding | None:
 
 def diagnose_config(
     service_cache: ServiceDataCache,
-    ecs_client,
     cluster: str,
     service: str,
     region: str,

@@ -189,13 +189,22 @@ def _get_task_network_details(
             arns = stopped.get("taskArns", [])
         if not arns:
             return [], [], None
+    except ClientError as exc:
+        if is_access_denied(exc):
+            return [], [], iam_finding(
+                "ecs:ListTasks",
+                cluster_resource_arn(region, account_id, cluster),
+                _SOURCE,
+            )
+        return [], [], None
 
+    try:
         tasks_resp = ecs_client.describe_tasks(cluster=cluster, tasks=arns[:1])
         task = tasks_resp.get("tasks", [{}])[0]
     except ClientError as exc:
         if is_access_denied(exc):
             return [], [], iam_finding(
-                "ecs:ListTasks",
+                "ecs:DescribeTasks",
                 cluster_resource_arn(region, account_id, cluster),
                 _SOURCE,
             )
